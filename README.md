@@ -1,105 +1,97 @@
-<div align="center">
-  <img src="nanobot_logo.png" alt="nanobot" width="500">
-  <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
-  <p>
-    <a href="https://pypi.org/project/nanobot-ai/"><img src="https://img.shields.io/pypi/v/nanobot-ai" alt="PyPI"></a>
-    <a href="https://pepy.tech/project/nanobot-ai"><img src="https://static.pepy.tech/badge/nanobot-ai" alt="Downloads"></a>
-    <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
-    <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white" alt="WeChat"></a>
-    <a href="https://discord.gg/MnCvHqpUGB"><img src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
-  </p>
-</div>
+# nanobot-feishu: Feishu-Specialized nanobot Fork
 
-🐈 **nanobot** is an **ultra-lightweight** personal AI assistant inspired by [Clawdbot](https://github.com/openclaw/openclaw) 
+A **Feishu-focused** fork of [nanobot](https://github.com/HKUDS/nanobot) — an ultra-lightweight personal AI assistant. This version extends nanobot with enhanced Feishu integration, new tools for PDF parsing, image generation, and session management, while refining the message delivery and context management mechanisms for a more reliable and feature-rich Feishu bot experience.
 
-⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
+## What's Changed
 
-📏 Real-time line count: **3,428 lines** (run `bash core_agent_lines.sh` to verify anytime)
+This fork introduces the following modifications on top of the original nanobot project:
 
-## 📢 News
+### 1. New Tool: `parse_pdf_mineru`
 
-- **2026-02-05** ✨ Added Feishu channel, DeepSeek provider, and enhanced scheduled tasks support!
-- **2026-02-04** 🚀 Released v0.1.3.post4 with multi-provider & Docker support! Check [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post4) for details.
-- **2026-02-03** ⚡ Integrated vLLM for local LLM support and improved natural language task scheduling!
-- **2026-02-02** 🎉 nanobot officially launched! Welcome to try 🐈 nanobot!
+A PDF parsing tool powered by the [MinerU](https://mineru.net) KIE HTTP API. It accepts a public PDF URL, submits it to the MinerU service for extraction, polls for completion, and returns the full Markdown content with metadata.
 
-## Key Features of nanobot:
+- Asynchronous polling with configurable timeout and interval
+- Supports model version override (e.g. `vlm`)
+- Downloads and extracts `full.md` from the result ZIP archive
+- Configured via `tools.mineru` in `config.json`
 
-🪶 **Ultra-Lightweight**: Just ~3,400 lines of core agent code — 99% smaller than Clawdbot.
+### 2. New Tool: `image_generate`
 
-🔬 **Research-Ready**: Clean, readable code that's easy to understand, modify, and extend for research.
+An image generation tool that calls a model API (OpenAI-compatible endpoint) to generate or edit images, with optional direct delivery to Feishu.
 
-⚡️ **Lightning Fast**: Minimal footprint means faster startup, lower resource usage, and quicker iterations.
+- **Text-to-image**: Generate images from a text prompt
+- **Image editing**: Accept single or multiple input images for editing tasks
+- **Aspect ratio control**: Supports `1:1`, `16:9`, `original`, etc.
+- **Feishu integration**: Optionally upload the generated image and send it as a rich post message to Feishu directly
+- **Auto-save**: Saves output to `workspace/outputs/images/` by default
+- Configured via `tools.image_gen` in `config.json`
 
-💎 **Easy-to-Use**: One-click to deploy and you're ready to go.
+### 3. New Tool: `session_manage`
 
-## 🏗️ Architecture
+A session management tool that enables the agent to programmatically create, switch, list, inspect, and reset conversation sessions.
 
-<p align="center">
-  <img src="nanobot_arch.png" alt="nanobot architecture" width="800">
-</p>
+- **`create`**: Create a new session with an auto-generated or custom title, optionally activate it immediately
+- **`switch`**: Switch the active session to an existing one by key
+- **`list`**: List all sessions with titles and timestamps
+- **`current`**: Show the currently active session
+- **`reset`**: Clear the active session override and fall back to the default channel session
 
-## ✨ Features
+This allows the agent to maintain multiple parallel conversation contexts per user/chat.
 
-<table align="center">
-  <tr align="center">
-    <th><p align="center">📈 24/7 Real-Time Market Analysis</p></th>
-    <th><p align="center">🚀 Full-Stack Software Engineer</p></th>
-    <th><p align="center">📅 Smart Daily Routine Manager</p></th>
-    <th><p align="center">📚 Personal Knowledge Assistant</p></th>
-  </tr>
-  <tr>
-    <td align="center"><p align="center"><img src="case/search.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/code.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/scedule.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/memory.gif" width="180" height="400"></p></td>
-  </tr>
-  <tr>
-    <td align="center">Discovery • Insights • Trends</td>
-    <td align="center">Develop • Deploy • Scale</td>
-    <td align="center">Schedule • Automate • Organize</td>
-    <td align="center">Learn • Memory • Reasoning</td>
-  </tr>
-</table>
+### 4. Enhanced Feishu Channel
 
-## 📦 Install
+The original Feishu channel implementation has been significantly upgraded:
 
-**Install from source** (latest features, recommended for development)
+- **Markdown-based messages**: Bot responses are now sent as rich-text **post** messages using Feishu's `md` tag, providing a more visually appealing and structured output
+- **Image receiving**: The bot can receive image messages from users — images are automatically downloaded via the Feishu API and saved to a configurable media directory
+- **Image sending**: Supports uploading and sending images as rich post messages with titles
+- **File sending**: Supports uploading and sending files (PDF, DOCX, XLSX, PPTX, etc.) as file messages, with a 30MB size limit
+- **Multi-media in a single message**: Text, images, and files can be combined in a single outbound message
+- **Reaction feedback**: Automatically adds a thumbs-up reaction to received messages as a "seen" indicator
+
+### 5. Transparent Tool-Call Notifications
+
+The message pushing mechanism has been enhanced to provide visibility into the agent's reasoning process:
+
+- When the agent invokes a tool, a **real-time notification** is pushed to the user showing the tool name and its parameters in a formatted code block
+- Tool-call records are also written into the session history, giving the user a clear trace of agent behavior
+- This makes the agent's actions fully transparent and easier to debug
+
+### 6. Improved Session Context with Tool-Call History
+
+The session management logic now **records tool-call actions into the conversation context**:
+
+- Each tool invocation is saved as an assistant message (e.g., `🛠️Tool Call: web_search`) in the session history
+- This prevents the agent from misjudging similar tasks — by seeing its own prior tool calls, it avoids erroneous tool selection or missed invocations
+- Results in more consistent and reliable agent behavior across multi-turn conversations
+
+---
+
+## Quick Start
+
+### 1. Install
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
+git clone <this-repo-url>
 cd nanobot
 pip install -e .
 ```
 
-**Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
+For Feishu support, also install the Feishu SDK:
 
 ```bash
-uv tool install nanobot-ai
+pip install lark-oapi
 ```
 
-**Install from PyPI** (stable)
-
-```bash
-pip install nanobot-ai
-```
-
-## 🚀 Quick Start
-
-> [!TIP]
-> Set your API key in `~/.nanobot/config.json`.
-> Get API keys: [OpenRouter](https://openrouter.ai/keys) (LLM) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
-> You can also change the model to `minimax/minimax-m2` for lower cost.
-
-**1. Initialize**
+### 2. Initialize
 
 ```bash
 nanobot onboard
 ```
 
-**2. Configure** (`~/.nanobot/config.json`)
+### 3. Configure
+
+Edit `~/.nanobot/config.json`:
 
 ```json
 {
@@ -113,208 +105,6 @@ nanobot onboard
       "model": "anthropic/claude-opus-4-5"
     }
   },
-  "tools": {
-    "web": {
-      "search": {
-        "apiKey": "BSA-xxx"
-      }
-    }
-  }
-}
-```
-
-
-**3. Chat**
-
-```bash
-nanobot agent -m "What is 2+2?"
-```
-
-That's it! You have a working AI assistant in 2 minutes.
-
-## 🖥️ Local Models (vLLM)
-
-Run nanobot with your own local models using vLLM or any OpenAI-compatible server.
-
-**1. Start your vLLM server**
-
-```bash
-vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
-```
-
-**2. Configure** (`~/.nanobot/config.json`)
-
-```json
-{
-  "providers": {
-    "vllm": {
-      "apiKey": "dummy",
-      "apiBase": "http://localhost:8000/v1"
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "meta-llama/Llama-3.1-8B-Instruct"
-    }
-  }
-}
-```
-
-**3. Chat**
-
-```bash
-nanobot agent -m "Hello from my local LLM!"
-```
-
-> [!TIP]
-> The `apiKey` can be any non-empty string for local servers that don't require authentication.
-
-## 💬 Chat Apps
-
-Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime, anywhere.
-
-| Channel | Setup |
-|---------|-------|
-| **Telegram** | Easy (just a token) |
-| **Discord** | Easy (bot token + intents) |
-| **WhatsApp** | Medium (scan QR) |
-| **Feishu** | Medium (app credentials) |
-
-<details>
-<summary><b>Telegram</b> (Recommended)</summary>
-
-**1. Create a bot**
-- Open Telegram, search `@BotFather`
-- Send `/newbot`, follow prompts
-- Copy the token
-
-**2. Configure**
-
-```json
-{
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
-    }
-  }
-}
-```
-
-> Get your user ID from `@userinfobot` on Telegram.
-
-**3. Run**
-
-```bash
-nanobot gateway
-```
-
-</details>
-
-<details>
-<summary><b>Discord</b></summary>
-
-**1. Create a bot**
-- Go to https://discord.com/developers/applications
-- Create an application → Bot → Add Bot
-- Copy the bot token
-
-**2. Enable intents**
-- In the Bot settings, enable **MESSAGE CONTENT INTENT**
-- (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
-
-**3. Get your User ID**
-- Discord Settings → Advanced → enable **Developer Mode**
-- Right-click your avatar → **Copy User ID**
-
-**4. Configure**
-
-```json
-{
-  "channels": {
-    "discord": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
-    }
-  }
-}
-```
-
-**5. Invite the bot**
-- OAuth2 → URL Generator
-- Scopes: `bot`
-- Bot Permissions: `Send Messages`, `Read Message History`
-- Open the generated invite URL and add the bot to your server
-
-**6. Run**
-
-```bash
-nanobot gateway
-```
-
-</details>
-
-<details>
-<summary><b>WhatsApp</b></summary>
-
-Requires **Node.js ≥18**.
-
-**1. Link device**
-
-```bash
-nanobot channels login
-# Scan QR with WhatsApp → Settings → Linked Devices
-```
-
-**2. Configure**
-
-```json
-{
-  "channels": {
-    "whatsapp": {
-      "enabled": true,
-      "allowFrom": ["+1234567890"]
-    }
-  }
-}
-```
-
-**3. Run** (two terminals)
-
-```bash
-# Terminal 1
-nanobot channels login
-
-# Terminal 2
-nanobot gateway
-```
-
-</details>
-
-<details>
-<summary><b>Feishu (飞书)</b></summary>
-
-Uses **WebSocket** long connection — no public IP required.
-
-```bash
-pip install nanobot-ai[feishu]
-```
-
-**1. Create a Feishu bot**
-- Visit [Feishu Open Platform](https://open.feishu.cn/app)
-- Create a new app → Enable **Bot** capability
-- **Permissions**: Add `im:message` (send messages)
-- **Events**: Add `im.message.receive_v1` (receive messages)
-  - Select **Long Connection** mode (requires running nanobot first to establish connection)
-- Get **App ID** and **App Secret** from "Credentials & Basic Info"
-- Publish the app
-
-**2. Configure**
-
-```json
-{
   "channels": {
     "feishu": {
       "enabled": true,
@@ -324,32 +114,61 @@ pip install nanobot-ai[feishu]
       "verificationToken": "",
       "allowFrom": []
     }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "apiKey": "BSA-xxx"
+      }
+    },
+    "mineru": {
+      "enabled": true,
+      "apiUrl": "https://mineru.net/api/v4/extract/task",
+      "token": "YOUR_MINERU_TOKEN",
+      "modelVersion": "vlm",
+      "timeout": 100,
+      "pollInterval": 5
+    },
+    "image_gen": {
+      "enabled": true,
+      "apiBase": "https://your-image-api-endpoint/v1",
+      "apiKey": "YOUR_IMAGE_GEN_API_KEY",
+      "modelName": "your-model-name",
+      "timeout": 120
+    }
   }
 }
 ```
 
-> `encryptKey` and `verificationToken` are optional for Long Connection mode.
-> `allowFrom`: Leave empty to allow all users, or add `["ou_xxx"]` to restrict access.
+### 4. Set Up Feishu Bot
 
-**3. Run**
+1. Visit [Feishu Open Platform](https://open.feishu.cn/app)
+2. Create a new app → Enable **Bot** capability
+3. **Permissions**: Add `im:message` (send messages), `im:message:send_as_bot`, `im:resource` (download images)
+4. **Events**: Subscribe to `im.message.receive_v1` (receive messages)
+   - Select **Long Connection** (WebSocket) mode — no public IP required
+5. Get **App ID** and **App Secret** from "Credentials & Basic Info"
+6. Publish the app
+
+### 5. Run
 
 ```bash
 nanobot gateway
 ```
 
-> [!TIP]
-> Feishu uses WebSocket to receive messages — no webhook or public IP needed!
+Or chat directly via CLI:
 
-</details>
+```bash
+nanobot agent -m "Hello!"
+```
 
-## ⚙️ Configuration
+---
+
+## Configuration Reference
 
 Config file: `~/.nanobot/config.json`
 
 ### Providers
-
-> [!NOTE]
-> Groq provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
@@ -357,9 +176,27 @@ Config file: `~/.nanobot/config.json`
 | `anthropic` | LLM (Claude direct) | [console.anthropic.com](https://console.anthropic.com) |
 | `openai` | LLM (GPT direct) | [platform.openai.com](https://platform.openai.com) |
 | `deepseek` | LLM (DeepSeek direct) | [platform.deepseek.com](https://platform.deepseek.com) |
-| `groq` | LLM + **Voice transcription** (Whisper) | [console.groq.com](https://console.groq.com) |
+| `groq` | LLM + Voice transcription (Whisper) | [console.groq.com](https://console.groq.com) |
 | `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
 
+### Tool-Specific API Keys
+
+| Tool | Config Path | Required Keys |
+|------|------------|---------------|
+| Web Search | `tools.web.search` | `apiKey` ([Serper](https://serper.dev)) |
+| MinerU PDF | `tools.mineru` | `token` ([MinerU](https://mineru.net)) |
+| Image Generation | `tools.image_gen` | `apiBase`, `apiKey`, `modelName` |
+
+### Feishu Channel
+
+| Field | Description |
+|-------|-------------|
+| `appId` | App ID from Feishu Open Platform |
+| `appSecret` | App Secret from Feishu Open Platform |
+| `encryptKey` | Encrypt Key (optional for WebSocket mode) |
+| `verificationToken` | Verification Token (optional for WebSocket mode) |
+| `allowFrom` | Allowed user `open_id` list; empty = allow all |
+| `mediaDir` | Directory to save received media (default: `~/.nanobot/media`) |
 
 <details>
 <summary><b>Full config example</b></summary>
@@ -368,51 +205,57 @@ Config file: `~/.nanobot/config.json`
 {
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-opus-4-5"
+      "model": "anthropic/claude-opus-4-5",
+      "maxTokens": 8192,
+      "temperature": 0.7,
+      "maxToolIterations": 20
     }
   },
   "providers": {
     "openrouter": {
       "apiKey": "sk-or-v1-xxx"
-    },
-    "groq": {
-      "apiKey": "gsk_xxx"
     }
   },
   "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "123456:ABC...",
-      "allowFrom": ["123456789"]
-    },
-    "discord": {
-      "enabled": false,
-      "token": "YOUR_DISCORD_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
-    },
-    "whatsapp": {
-      "enabled": false
-    },
     "feishu": {
-      "enabled": false,
+      "enabled": true,
       "appId": "cli_xxx",
       "appSecret": "xxx",
       "encryptKey": "",
       "verificationToken": "",
-      "allowFrom": []
+      "allowFrom": [],
+      "mediaDir": "~/.nanobot/media"
     }
   },
   "tools": {
     "web": {
       "search": {
-        "apiKey": "BSA..."
+        "apiKey": "BSA-xxx"
       }
-    }
+    },
+    "mineru": {
+      "enabled": true,
+      "apiUrl": "https://mineru.net/api/v4/extract/task",
+      "token": "YOUR_MINERU_TOKEN",
+      "modelVersion": "vlm",
+      "timeout": 100,
+      "pollInterval": 5
+    },
+    "image_gen": {
+      "enabled": true,
+      "apiBase": "https://your-image-api-endpoint/v1",
+      "apiKey": "YOUR_KEY",
+      "modelName": "your-model",
+      "timeout": 120
+    },
+    "restrictToWorkspace": false
   }
 }
 ```
 
 </details>
+
+---
 
 ## CLI Reference
 
@@ -421,71 +264,58 @@ Config file: `~/.nanobot/config.json`
 | `nanobot onboard` | Initialize config & workspace |
 | `nanobot agent -m "..."` | Chat with the agent |
 | `nanobot agent` | Interactive chat mode |
-| `nanobot gateway` | Start the gateway |
+| `nanobot gateway` | Start the gateway (Feishu bot) |
 | `nanobot status` | Show status |
-| `nanobot channels login` | Link WhatsApp (scan QR) |
-| `nanobot channels status` | Show channel status |
+| `nanobot cron add` | Add a scheduled task |
+| `nanobot cron list` | List scheduled tasks |
+| `nanobot cron remove <id>` | Remove a scheduled task |
 
-<details>
-<summary><b>Scheduled Tasks (Cron)</b></summary>
+---
 
-```bash
-# Add a job
-nanobot cron add --name "daily" --message "Good morning!" --cron "0 9 * * *"
-nanobot cron add --name "hourly" --message "Check status" --every 3600
-
-# List jobs
-nanobot cron list
-
-# Remove a job
-nanobot cron remove <job_id>
-```
-
-</details>
-
-## 🐳 Docker
-
-> [!TIP]
-> The `-v ~/.nanobot:/root/.nanobot` flag mounts your local config directory into the container, so your config and workspace persist across container restarts.
-
-Build and run nanobot in a container:
-
-```bash
-# Build the image
-docker build -t nanobot .
-
-# Initialize config (first time only)
-docker run -v ~/.nanobot:/root/.nanobot --rm nanobot onboard
-
-# Edit config on host to add API keys
-vim ~/.nanobot/config.json
-
-# Run gateway (connects to Telegram/WhatsApp)
-docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
-
-# Or run a single command
-docker run -v ~/.nanobot:/root/.nanobot --rm nanobot agent -m "Hello!"
-docker run -v ~/.nanobot:/root/.nanobot --rm nanobot status
-```
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 nanobot/
-├── agent/          # 🧠 Core agent logic
-│   ├── loop.py     #    Agent loop (LLM ↔ tool execution)
-│   ├── context.py  #    Prompt builder
-│   ├── memory.py   #    Persistent memory
-│   ├── skills.py   #    Skills loader
-│   ├── subagent.py #    Background task execution
-│   └── tools/      #    Built-in tools (incl. spawn)
-├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
-├── channels/       # 📱 WhatsApp integration
-├── bus/            # 🚌 Message routing
-├── cron/           # ⏰ Scheduled tasks
-├── heartbeat/      # 💓 Proactive wake-up
-├── providers/      # 🤖 LLM providers (OpenRouter, etc.)
-├── session/        # 💬 Conversation sessions
-├── config/         # ⚙️ Configuration
-└── cli/            # 🖥️ Commands
+├── agent/                # Core agent logic
+│   ├── loop.py           #   Agent loop (LLM ↔ tool execution)
+│   ├── context.py        #   Prompt & context builder
+│   ├── memory.py         #   Persistent memory
+│   ├── skills.py         #   Skills loader
+│   ├── subagent.py       #   Background task execution
+│   └── tools/            #   Built-in tools
+│       ├── base.py       #     Tool base class
+│       ├── registry.py   #     Dynamic tool registry
+│       ├── filesystem.py #     File read/write/edit/list
+│       ├── shell.py      #     Shell command execution
+│       ├── web.py        #     Web search & fetch
+│       ├── message.py    #     Message sending (text, image, file)
+│       ├── pdf_mineru.py #     ★ PDF parsing via MinerU API
+│       ├── image_generate.py # ★ Image generation & Feishu delivery
+│       ├── session_manage.py # ★ Session create/switch/reset
+│       ├── spawn.py      #     Subagent spawning
+│       └── cron.py       #     Cron task management
+├── channels/             # Chat channel integrations
+│   ├── base.py           #   Base channel interface
+│   ├── feishu.py         #   ★ Enhanced Feishu (markdown, image, file)
+│   ├── telegram.py       #   Telegram
+│   ├── discord.py        #   Discord
+│   └── whatsapp.py       #   WhatsApp
+├── session/              # Conversation session management
+│   └── manager.py        #   ★ Session CRUD with active session tracking
+├── bus/                  # Message routing (event bus)
+├── cron/                 # Scheduled tasks
+├── heartbeat/            # Proactive wake-up
+├── providers/            # LLM providers (LiteLLM-based)
+├── config/               # Configuration schema & loader
+├── skills/               # Bundled skills (github, weather, tmux...)
+├── cli/                  # CLI commands
+└── utils/                # Helpers
 ```
+
+> Items marked with ★ are new or significantly modified in this fork.
+
+---
+
+## Acknowledgements
+
+This project is based on [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS). Licensed under [MIT](./LICENSE).
