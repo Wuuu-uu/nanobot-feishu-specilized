@@ -1,8 +1,13 @@
-# nanobot-feishu: Feishu-Specialized nanobot Fork
+<div align="center">
+  <img src="nanobot-feishu_logo.jpg" alt="nanobot" width="500">
+  <h1>nanobot-feishu: Feishu-Specialized AI Assistant</h1>
+</div>
+
+# 🐈 nanobot-feishu: Feishu-Specialized nanobot Fork
 
 A **Feishu-focused** fork of [nanobot](https://github.com/HKUDS/nanobot) — an ultra-lightweight personal AI assistant. This version extends nanobot with enhanced Feishu integration, new tools for PDF parsing, image generation, and session management, while refining the message delivery and context management mechanisms for a more reliable and feature-rich Feishu bot experience.
 
-## What's Changed
+## 🌟 What's Changed
 
 This fork introduces the following modifications on top of the original nanobot project:
 
@@ -67,7 +72,7 @@ The session management logic now **records tool-call actions into the conversati
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Install
 
@@ -118,24 +123,25 @@ Edit `~/.nanobot/config.json`:
   "tools": {
     "web": {
       "search": {
-        "apiKey": "BSA-xxx"
+        "apiKey": "",
+        "maxResults": 5
       }
     },
+    "exec": {
+      "timeout": 60
+    },
     "mineru": {
-      "enabled": true,
-      "apiUrl": "https://mineru.net/api/v4/extract/task",
-      "token": "YOUR_MINERU_TOKEN",
-      "modelVersion": "vlm",
-      "timeout": 100,
-      "pollInterval": 5
+      "api_url": "https://mineru.net/api/v4/extract/task",
+      "token": "",
+      "model_version": "vlm",
+      "timeout": 100
     },
     "image_gen": {
-      "enabled": true,
-      "apiBase": "https://your-image-api-endpoint/v1",
-      "apiKey": "YOUR_IMAGE_GEN_API_KEY",
-      "modelName": "your-model-name",
-      "timeout": 120
-    }
+      "api_base": "",
+      "api_key": "",
+      "model_name": "gemini-3-pro-image-preview"
+    },
+    "restrictToWorkspace": false
   }
 }
 ```
@@ -144,7 +150,8 @@ Edit `~/.nanobot/config.json`:
 
 1. Visit [Feishu Open Platform](https://open.feishu.cn/app)
 2. Create a new app → Enable **Bot** capability
-3. **Permissions**: Add `im:message` (send messages), `im:message:send_as_bot`, `im:resource` (download images)
+3. **Permissions**: Add `im:message` (send messages), `im:message:send_as_bot`, `im:resource` (download images), `im:message:readonly` (receive messages), `im:message.p2p_msg:readonly` (receive private messages), `docs:document.content:read` (read cloud document content)
+> **Note: ** As for multi-user senarios, you also need to add `contact:user.employee_id:readonly` to allow the bot to identify the user's Feishu ID.
 4. **Events**: Subscribe to `im.message.receive_v1` (receive messages)
    - Select **Long Connection** (WebSocket) mode — no public IP required
 5. Get **App ID** and **App Secret** from "Credentials & Basic Info"
@@ -168,7 +175,7 @@ nanobot agent -m "Hello!"
 
 Config file: `~/.nanobot/config.json`
 
-### Providers
+### 🔌 Providers
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
@@ -179,7 +186,7 @@ Config file: `~/.nanobot/config.json`
 | `groq` | LLM + Voice transcription (Whisper) | [console.groq.com](https://console.groq.com) |
 | `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
 
-### Tool-Specific API Keys
+### 🛠️ Tool-Specific API Keys
 
 | Tool | Config Path | Required Keys |
 |------|------------|---------------|
@@ -187,7 +194,7 @@ Config file: `~/.nanobot/config.json`
 | MinerU PDF | `tools.mineru` | `token` ([MinerU](https://mineru.net)) |
 | Image Generation | `tools.image_gen` | `apiBase`, `apiKey`, `modelName` |
 
-### Feishu Channel
+### 📡 Feishu Channel
 
 | Field | Description |
 |-------|-------------|
@@ -205,10 +212,11 @@ Config file: `~/.nanobot/config.json`
 {
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-opus-4-5",
-      "maxTokens": 8192,
+      "workspace": "~/.nanobot/workspace",
+      "model": "openai/Claude-Sonnet-4.5",
+      "maxTokens": 10240,
       "temperature": 0.7,
-      "maxToolIterations": 20
+      "maxToolIterations": 50
     }
   },
   "providers": {
@@ -223,30 +231,29 @@ Config file: `~/.nanobot/config.json`
       "appSecret": "xxx",
       "encryptKey": "",
       "verificationToken": "",
-      "allowFrom": [],
-      "mediaDir": "~/.nanobot/media"
+      "allowFrom": []
     }
   },
   "tools": {
     "web": {
       "search": {
-        "apiKey": "BSA-xxx"
+        "apiKey": "",
+        "maxResults": 5
       }
     },
+    "exec": {
+      "timeout": 60
+    },
     "mineru": {
-      "enabled": true,
-      "apiUrl": "https://mineru.net/api/v4/extract/task",
-      "token": "YOUR_MINERU_TOKEN",
-      "modelVersion": "vlm",
-      "timeout": 100,
-      "pollInterval": 5
+      "api_url": "https://mineru.net/api/v4/extract/task",
+      "token": "",
+      "model_version": "vlm",
+      "timeout": 100
     },
     "image_gen": {
-      "enabled": true,
-      "apiBase": "https://your-image-api-endpoint/v1",
-      "apiKey": "YOUR_KEY",
-      "modelName": "your-model",
-      "timeout": 120
+      "api_base": "",
+      "api_key": "",
+      "model_name": "gemini-3-pro-image-preview"
     },
     "restrictToWorkspace": false
   }
@@ -272,7 +279,7 @@ Config file: `~/.nanobot/config.json`
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 nanobot/
