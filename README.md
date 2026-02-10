@@ -76,8 +76,8 @@ The session management logic now **records tool-call actions into the conversati
 ### 1. Install
 
 ```bash
-git clone <this-repo-url>
-cd nanobot
+git clone https://github.com/Wuuu-uu/nanobot-feishu-specilized.git
+cd nanobot-feishu-specilized
 pip install -e .
 ```
 
