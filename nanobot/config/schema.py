@@ -28,6 +28,7 @@ class FeishuConfig(BaseModel):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+    media_dir: str = "~/.nanobot/media"  # Directory to save received media files
 
 
 class DiscordConfig(BaseModel):
@@ -88,7 +89,14 @@ class GatewayConfig(BaseModel):
 
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
-    api_key: str = ""  # Brave Search API key
+    api_key: str = ""  # Serper API key
+    endpoint: str = "https://google.serper.dev/search"
+    country: str | None = None  # gl
+    language: str | None = None  # hl
+    tbs: str | None = None  # Date range
+    page: int | None = None
+    autocorrect: bool | None = None
+    search_type: str | None = None  # Serper "type" field
     max_results: int = 5
 
 
@@ -102,10 +110,31 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
+class MineruConfig(BaseModel):
+    """MinerU KIE PDF parsing tool configuration."""
+    enabled: bool = True
+    api_url: str = "https://mineru.net/api/v4/extract/task"
+    token: str = ""
+    model_version: str = "vlm"
+    timeout: int = 100
+    poll_interval: int = 5
+
+
+class ImageGenConfig(BaseModel):
+    """Image generation tool configuration."""
+    enabled: bool = True
+    api_base: str = ""
+    api_key: str = ""
+    model_name: str = ""
+    timeout: int = 120
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    mineru: MineruConfig = Field(default_factory=MineruConfig)
+    image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
@@ -170,10 +199,14 @@ class Config(BaseSettings):
         model = (model or self.agents.defaults.model).lower()
         if "openrouter" in model:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
+        if any(k in model for k in ("openai", "gpt")):
+            return self.providers.openai.api_base
         if any(k in model for k in ("zhipu", "glm", "zai")):
             return self.providers.zhipu.api_base
         if "vllm" in model:
             return self.providers.vllm.api_base
+        if self.providers.openai.api_base:
+            return self.providers.openai.api_base
         return None
     
     class Config:

@@ -32,17 +32,21 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
-        brave_api_key: str | None = None,
+        web_search_config: "WebSearchConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
+        mineru_config: "MineruConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import MineruConfig
+        from nanobot.config.schema import WebSearchConfig
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
-        self.brave_api_key = brave_api_key
+        self.web_search_config = web_search_config or WebSearchConfig()
         self.exec_config = exec_config or ExecToolConfig()
+        self.mineru_config = mineru_config or MineruConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
     
@@ -107,8 +111,25 @@ class SubagentManager:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            tools.register(WebSearchTool(
+                api_key=self.web_search_config.api_key or None,
+                max_results=self.web_search_config.max_results,
+                endpoint=self.web_search_config.endpoint,
+                country=self.web_search_config.country,
+                language=self.web_search_config.language,
+                tbs=self.web_search_config.tbs,
+                page=self.web_search_config.page,
+                autocorrect=self.web_search_config.autocorrect,
+                search_type=self.web_search_config.search_type,
+            ))
             tools.register(WebFetchTool())
+
+            if self.mineru_config and self.mineru_config.enabled:
+                from nanobot.agent.tools.pdf_mineru import MineruPdfParseTool
+                tools.register(MineruPdfParseTool(
+                    config=self.mineru_config,
+                    allowed_dir=allowed_dir,
+                ))
             
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)

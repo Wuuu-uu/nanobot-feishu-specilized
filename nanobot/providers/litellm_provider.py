@@ -32,8 +32,15 @@ class LiteLLMProvider(LLMProvider):
             (api_base and "openrouter" in api_base)
         )
         
-        # Track if using custom endpoint (vLLM, etc.)
-        self.is_vllm = bool(api_base) and not self.is_openrouter
+        # Track if using vLLM endpoint (explicitly marked by model or api_base)
+        self.is_vllm = (
+            bool(api_base)
+            and not self.is_openrouter
+            and (
+                "vllm" in default_model.lower() or
+                (api_base and "vllm" in api_base.lower())
+            )
+        )
         
         # Configure LiteLLM based on provider
         if api_key:
@@ -58,6 +65,9 @@ class LiteLLMProvider(LLMProvider):
             elif "moonshot" in default_model or "kimi" in default_model:
                 os.environ.setdefault("MOONSHOT_API_KEY", api_key)
                 os.environ.setdefault("MOONSHOT_API_BASE", api_base or "https://api.moonshot.cn/v1")
+            else:
+                # Default to OpenAI-compatible API keys for custom endpoints
+                os.environ.setdefault("OPENAI_API_KEY", api_key)
         
         if api_base:
             litellm.api_base = api_base
@@ -108,7 +118,7 @@ class LiteLLMProvider(LLMProvider):
             model = f"moonshot/{model}"
 
         # For Gemini, ensure gemini/ prefix if not already present
-        if "gemini" in model.lower() and not model.startswith("gemini/"):
+        if ("gemini" in model.lower() and not model.startswith("gemini/") and not model.startswith("openai/")):
             model = f"gemini/{model}"
 
         # For vLLM, use hosted_vllm/ prefix per LiteLLM docs

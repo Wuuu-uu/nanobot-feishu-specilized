@@ -186,7 +186,7 @@ def gateway(
 
     if not api_key and not is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey")
+        console.print("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey or providers.openai.apiKey")
         raise typer.Exit(1)
     
     provider = LiteLLMProvider(
@@ -206,8 +206,11 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        brave_api_key=config.tools.web.search.api_key or None,
+        web_search_config=config.tools.web.search,
         exec_config=config.tools.exec,
+        mineru_config=config.tools.mineru,
+        image_gen_config=config.tools.image_gen,
+        feishu_config=config.channels.feishu,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )
@@ -315,8 +318,9 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        brave_api_key=config.tools.web.search.api_key or None,
+        web_search_config=config.tools.web.search,
         exec_config=config.tools.exec,
+        mineru_config=config.tools.mineru,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )
     

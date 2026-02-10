@@ -63,6 +63,29 @@ web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 - Supports markdown or plain text extraction
 - Output is truncated at 50,000 characters by default
 
+## PDF Parsing (MinerU)
+
+### parse_pdf_mineru
+Parse a local PDF via MinerU KIE and return extracted text with metadata.
+```
+parse_pdf_mineru(path: str, timeout: int = None, poll_interval: int = None) -> str
+```
+
+**Config required:**
+```json
+{
+    "tools": {
+        "mineru": {
+            "enabled": true,
+            "baseUrl": "https://mineru.net/api/kie",
+            "pipelineId": "YOUR_PIPELINE_ID",
+            "timeout": 60,
+            "pollInterval": 5
+        }
+    }
+}
+```
+
 ## Communication
 
 ### message
