@@ -1,6 +1,5 @@
 <div align="center">
   <img src="nanobot-feishu_logo.jpg" alt="nanobot" width="500">
-  <h1>nanobot-feishu: Feishu-Specialized AI Assistant</h1>
 </div>
 
 # 🐈 nanobot-feishu: Feishu-Specialized nanobot Fork
