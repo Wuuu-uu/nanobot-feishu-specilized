@@ -10,7 +10,7 @@ A **Feishu-focused** fork of [nanobot](https://github.com/HKUDS/nanobot) — an 
 
 This fork introduces the following modifications on top of the original nanobot project:
 
-### 1. New Tool: `parse_pdf_mineru`
+### 1. 📄 New Tool: `parse_pdf_mineru`
 
 A PDF parsing tool powered by the [MinerU](https://mineru.net) KIE HTTP API. It accepts a public PDF URL, submits it to the MinerU service for extraction, polls for completion, and returns the full Markdown content with metadata.
 
@@ -19,7 +19,7 @@ A PDF parsing tool powered by the [MinerU](https://mineru.net) KIE HTTP API. It 
 - Downloads and extracts `full.md` from the result ZIP archive
 - Configured via `tools.mineru` in `config.json`
 
-### 2. New Tool: `image_generate`
+### 2. 🖼️ New Tool: `image_generate`
 
 An image generation tool that calls a model API (OpenAI-compatible endpoint) to generate or edit images, with optional direct delivery to Feishu.
 
@@ -30,7 +30,7 @@ An image generation tool that calls a model API (OpenAI-compatible endpoint) to 
 - **Auto-save**: Saves output to `workspace/outputs/images/` by default
 - Configured via `tools.image_gen` in `config.json`
 
-### 3. New Tool: `session_manage`
+### 3. 🗣️ New Tool: `session_manage`
 
 A session management tool that enables the agent to programmatically create, switch, list, inspect, and reset conversation sessions.
 
@@ -42,7 +42,7 @@ A session management tool that enables the agent to programmatically create, swi
 
 This allows the agent to maintain multiple parallel conversation contexts per user/chat.
 
-### 4. Enhanced Feishu Channel
+### 4. 🔄 Enhanced Feishu Channel
 
 The original Feishu channel implementation has been significantly upgraded:
 
@@ -53,7 +53,7 @@ The original Feishu channel implementation has been significantly upgraded:
 - **Multi-media in a single message**: Text, images, and files can be combined in a single outbound message
 - **Reaction feedback**: Automatically adds a thumbs-up reaction to received messages as a "seen" indicator
 
-### 5. Transparent Tool-Call Notifications
+### 5. 🔍 Transparent Tool-Call Notifications
 
 The message pushing mechanism has been enhanced to provide visibility into the agent's reasoning process:
 
@@ -61,7 +61,7 @@ The message pushing mechanism has been enhanced to provide visibility into the a
 - Tool-call records are also written into the session history, giving the user a clear trace of agent behavior
 - This makes the agent's actions fully transparent and easier to debug
 
-### 6. Improved Session Context with Tool-Call History
+### 6. 🛠️ Improved Session Context with Tool-Call History
 
 The session management logic now **records tool-call actions into the conversation context**:
 
@@ -322,6 +322,6 @@ nanobot/
 
 ---
 
-## Acknowledgements
+## 🙏 Acknowledgements
 
 This project is based on [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS). Licensed under [MIT](./LICENSE).
