@@ -280,7 +280,7 @@ class AgentLoop:
                             f"```json\n{args_str}\n```"
                         )
                     )
-                    session.add_message("assistant", f'🛠️Tool Call: {tool_call.name}')
+                    session.add_message("tool_call", f'{tool_call.name}')
                     await self.bus.publish_outbound(push_message)
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
