@@ -238,6 +238,8 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+
+        session.add_message("user", msg.content)
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -280,7 +282,7 @@ class AgentLoop:
                             f"```json\n{args_str}\n```"
                         )
                     )
-                    session.add_message("tool_call", f'{tool_call.name}')
+                    session.add_message("assistant", f'Tool Call: {tool_call.name}')
                     await self.bus.publish_outbound(push_message)
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
@@ -295,7 +297,6 @@ class AgentLoop:
             final_content = "I've completed processing but have no response to give."
         
         # Save to session
-        session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         
