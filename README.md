@@ -6,6 +6,10 @@
 
 A **Feishu-focused** fork of [nanobot](https://github.com/HKUDS/nanobot) — an ultra-lightweight personal AI assistant. This version extends nanobot with enhanced Feishu integration, new tools for PDF parsing, image generation, and session management, while refining the message delivery and context management mechanisms for a more reliable and feature-rich Feishu bot experience.
 
+## 📢 News
+- **2026-02-10**: First release of the Feishu-focused nanobot fork!
+- **2026-02-24**: Enhance CLI mode with feishu message send support
+
 ## 🌟 What's Changed
 
 This fork introduces the following modifications on top of the original nanobot project:

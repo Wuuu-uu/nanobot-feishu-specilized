@@ -321,8 +321,51 @@ def agent(
         web_search_config=config.tools.web.search,
         exec_config=config.tools.exec,
         mineru_config=config.tools.mineru,
+        feishu_config=config.channels.feishu,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )
+    
+    # --- Initialize channel senders for CLI mode ---
+    # In CLI mode there is no gateway dispatcher, so we attach lightweight
+    # channel senders directly so that the message tool can deliver to
+    # external channels (e.g. Feishu) even when invoked from cron scripts.
+    _cli_channels: dict[str, Any] = {}
+
+    if config.channels.feishu.enabled:
+        try:
+            from nanobot.channels.feishu import FeishuChannel, FEISHU_AVAILABLE
+            if FEISHU_AVAILABLE:
+                _feishu_ch = FeishuChannel(config.channels.feishu, bus)
+                # Initialise the Lark client for sending (no WebSocket needed)
+                import lark_oapi as _lark
+                _feishu_ch._client = _lark.Client.builder() \
+                    .app_id(config.channels.feishu.app_id) \
+                    .app_secret(config.channels.feishu.app_secret) \
+                    .log_level(_lark.LogLevel.WARNING) \
+                    .build()
+                _cli_channels["feishu"] = _feishu_ch
+        except Exception as e:
+            console.print(f"[dim]Feishu send init skipped: {e}[/dim]")
+
+    # Replace the default send_callback on the message tool so that
+    # outbound messages are dispatched directly to the appropriate channel
+    # sender instead of being queued on the bus (which has no consumer in
+    # CLI mode).
+    if _cli_channels:
+        from nanobot.agent.tools.message import MessageTool as _MT
+
+        async def _cli_send_callback(msg):
+            ch = _cli_channels.get(msg.channel)
+            if ch:
+                await ch.send(msg)
+            else:
+                # Fallback: just put on bus (original behaviour)
+                await bus.publish_outbound(msg)
+
+        _msg_tool = agent_loop.tools.get("message")
+        if isinstance(_msg_tool, _MT):
+            _msg_tool.set_send_callback(_cli_send_callback)
+    # --- End channel sender init ---
     
     if message:
         # Single message mode
