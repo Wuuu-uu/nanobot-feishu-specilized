@@ -210,6 +210,7 @@ def gateway(
         exec_config=config.tools.exec,
         mineru_config=config.tools.mineru,
         image_gen_config=config.tools.image_gen,
+        tool_history_config=config.tools.tool_history,
         feishu_config=config.channels.feishu,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -321,6 +322,7 @@ def agent(
         web_search_config=config.tools.web.search,
         exec_config=config.tools.exec,
         mineru_config=config.tools.mineru,
+        tool_history_config=config.tools.tool_history,
         feishu_config=config.channels.feishu,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )

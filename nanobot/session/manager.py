@@ -46,11 +46,83 @@ class Session:
         Returns:
             List of messages in LLM format.
         """
+        context_messages = [
+            m for m in self.messages
+            if m.get("include_in_context", True)
+        ]
+
         # Get recent messages
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        
+        recent = context_messages[-max_messages:] if len(context_messages) > max_messages else context_messages
+
         # Convert to LLM format (just role and content)
         return [{"role": m["role"], "content": m["content"]} for m in recent]
+
+    def add_tool_event(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: str,
+        ok: bool,
+        duration_ms: int,
+        args_preview_chars: int = 160,
+        result_preview_chars: int = 180,
+    ) -> None:
+        """Add a structured tool event to session, excluded from default LLM context."""
+        try:
+            args_preview = truncate_string(
+                json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                max_len=args_preview_chars,
+            )
+        except Exception:
+            args_preview = truncate_string(str(arguments), max_len=args_preview_chars)
+
+        result_preview = truncate_string(result, max_len=result_preview_chars)
+        status = "ok" if ok else "error"
+
+        self.add_message(
+            "assistant",
+            f"[tool] {tool_name} {status}",
+            include_in_context=False,
+            tool_event={
+                "name": tool_name,
+                "status": status,
+                "ok": ok,
+                "duration_ms": duration_ms,
+                "args_preview": args_preview,
+                "result_preview": result_preview,
+                "result_len": len(result),
+            },
+        )
+
+    def build_tool_digest(
+        self,
+        max_events: int = 5,
+        max_chars: int = 800,
+    ) -> str:
+        """Build a compact digest of recent tool events for model context."""
+        events = [
+            m.get("tool_event")
+            for m in self.messages
+            if isinstance(m.get("tool_event"), dict)
+        ]
+        if not events:
+            return ""
+
+        selected = events[-max(max_events, 1):]
+        lines = ["Recent tool execution summary:"]
+        for event in selected:
+            name = event.get("name", "unknown")
+            status = event.get("status", "unknown")
+            duration_ms = event.get("duration_ms", "?")
+            args_preview = event.get("args_preview", "")
+            result_preview = event.get("result_preview", "")
+            result_len = event.get("result_len", "?")
+            lines.append(
+                f"- {name}: {status}, {duration_ms}ms, args={args_preview}, result({result_len})={result_preview}"
+            )
+
+        digest = "\n".join(lines)
+        return truncate_string(digest, max_len=max_chars)
     
     def clear(self) -> None:
         """Clear all messages in the session."""
@@ -225,6 +297,16 @@ class SessionManager:
             path.unlink()
             return True
         return False
+
+    def build_tool_digest(
+        self,
+        key: str,
+        max_events: int = 5,
+        max_chars: int = 800,
+    ) -> str:
+        """Build compact recent tool-event digest for a session key."""
+        session = self.get_or_create(key)
+        return session.build_tool_digest(max_events=max_events, max_chars=max_chars)
     
     def list_sessions(self) -> list[dict[str, Any]]:
         """

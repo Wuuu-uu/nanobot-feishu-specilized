@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ class AgentLoop:
         exec_config: "ExecToolConfig | None" = None,
         mineru_config: "MineruConfig | None" = None,
         image_gen_config: "ImageGenConfig | None" = None,
+        tool_history_config: "ToolHistoryConfig | None" = None,
         feishu_config: "FeishuConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
@@ -55,6 +57,7 @@ class AgentLoop:
         from nanobot.config.schema import FeishuConfig
         from nanobot.config.schema import ImageGenConfig
         from nanobot.config.schema import MineruConfig
+        from nanobot.config.schema import ToolHistoryConfig
         from nanobot.config.schema import WebSearchConfig
         from nanobot.cron.service import CronService
         self.bus = bus
@@ -66,6 +69,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.mineru_config = mineru_config or MineruConfig()
         self.image_gen_config = image_gen_config or ImageGenConfig()
+        self.tool_history_config = tool_history_config or ToolHistoryConfig()
         self.feishu_config = feishu_config or FeishuConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -85,7 +89,42 @@ class AgentLoop:
         )
         
         self._running = False
+        self._tool_digest_max_events = max(1, self.tool_history_config.max_events)
+        self._tool_digest_max_chars = max(200, self.tool_history_config.max_chars)
+        self._tool_preview_chars = max(80, self.tool_history_config.preview_chars)
         self._register_default_tools()
+
+    def _inject_tool_digest(self, messages: list[dict[str, Any]], session_key: str) -> list[dict[str, Any]]:
+        """Inject compact recent tool execution summary into current context."""
+        tool_digest = self.sessions.build_tool_digest(
+            session_key,
+            max_events=self._tool_digest_max_events,
+            max_chars=self._tool_digest_max_chars,
+        )
+        if tool_digest:
+            return self.context.add_assistant_message(messages, tool_digest)
+        return messages
+
+    def _record_tool_event(
+        self,
+        session: Any,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: str,
+        started: float,
+    ) -> None:
+        """Persist structured tool event into session history (excluded from LLM context by default)."""
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        ok = not result.startswith("Error")
+        session.add_tool_event(
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+            ok=ok,
+            duration_ms=duration_ms,
+            args_preview_chars=self._tool_preview_chars,
+            result_preview_chars=self._tool_preview_chars,
+        )
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -234,6 +273,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        messages = self._inject_tool_digest(messages, session_key)
         
         # Agent loop
         iteration = 0
@@ -282,9 +322,17 @@ class AgentLoop:
                             f"```json\n{args_str}\n```"
                         )
                     )
-                    session.add_message("assistant", f'tool call logging: {tool_call.name}')
                     await self.bus.publish_outbound(push_message)
+                    started = time.perf_counter()
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_text = result if isinstance(result, str) else str(result)
+                    self._record_tool_event(
+                        session=session,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        result=result_text,
+                        started=started,
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -358,6 +406,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
+        messages = self._inject_tool_digest(messages, session_key)
         
         # Agent loop (limited for announce handling)
         iteration = 0
@@ -391,8 +440,16 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    session.add_message("assistant", f'🛠️Tool Call: {tool_call.name}')
+                    started = time.perf_counter()
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_text = result if isinstance(result, str) else str(result)
+                    self._record_tool_event(
+                        session=session,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        result=result_text,
+                        started=started,
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )

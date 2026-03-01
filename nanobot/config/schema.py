@@ -129,12 +129,20 @@ class ImageGenConfig(BaseModel):
     timeout: int = 120
 
 
+class ToolHistoryConfig(BaseModel):
+    """Tool history compression configuration for LLM context."""
+    max_events: int = 5
+    preview_chars: int = 160
+    max_chars: int = 800
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     mineru: MineruConfig = Field(default_factory=MineruConfig)
     image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
+    tool_history: ToolHistoryConfig = Field(default_factory=ToolHistoryConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
