@@ -1,10 +1,12 @@
 """Agent loop: the core processing engine."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -18,11 +20,24 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.image_generate import ImageGenerateTool
+from nanobot.agent.tools.notion import NotionTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.session_manage import SessionManageTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import (
+        ExecToolConfig,
+        FeishuConfig,
+        ImageGenConfig,
+        MineruConfig,
+        NotionToolConfig,
+        ToolHistoryConfig,
+        WebSearchConfig,
+    )
+    from nanobot.cron.service import CronService
 
 
 class AgentLoop:
@@ -44,19 +59,21 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 30,
-        web_search_config: "WebSearchConfig | None" = None,
-        exec_config: "ExecToolConfig | None" = None,
-        mineru_config: "MineruConfig | None" = None,
-        image_gen_config: "ImageGenConfig | None" = None,
-        tool_history_config: "ToolHistoryConfig | None" = None,
-        feishu_config: "FeishuConfig | None" = None,
-        cron_service: "CronService | None" = None,
+        web_search_config: WebSearchConfig | None = None,
+        exec_config: ExecToolConfig | None = None,
+        mineru_config: MineruConfig | None = None,
+        image_gen_config: ImageGenConfig | None = None,
+        notion_config: NotionToolConfig | None = None,
+        tool_history_config: ToolHistoryConfig | None = None,
+        feishu_config: FeishuConfig | None = None,
+        cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.config.schema import FeishuConfig
         from nanobot.config.schema import ImageGenConfig
         from nanobot.config.schema import MineruConfig
+        from nanobot.config.schema import NotionToolConfig
         from nanobot.config.schema import ToolHistoryConfig
         from nanobot.config.schema import WebSearchConfig
         from nanobot.cron.service import CronService
@@ -69,6 +86,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.mineru_config = mineru_config or MineruConfig()
         self.image_gen_config = image_gen_config or ImageGenConfig()
+        self.notion_config = notion_config or NotionToolConfig()
         self.tool_history_config = tool_history_config or ToolHistoryConfig()
         self.feishu_config = feishu_config or FeishuConfig()
         self.cron_service = cron_service
@@ -85,6 +103,7 @@ class AgentLoop:
             web_search_config=self.web_search_config,
             exec_config=self.exec_config,
             mineru_config=self.mineru_config,
+            notion_config=self.notion_config,
             restrict_to_workspace=restrict_to_workspace,
         )
         
@@ -146,6 +165,12 @@ class AgentLoop:
             allowed_dir=allowed_dir,
         )
         self.tools.register(image_tool)
+
+        # Notion tool (single database management)
+        self.tools.register(NotionTool(
+            config=self.notion_config,
+            allowed_dir=allowed_dir,
+        ))
 
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)

@@ -15,6 +15,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.agent.tools.notion import NotionTool
 
 
 class SubagentManager:
@@ -35,10 +36,12 @@ class SubagentManager:
         web_search_config: "WebSearchConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         mineru_config: "MineruConfig | None" = None,
+        notion_config: "NotionToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.config.schema import MineruConfig
+        from nanobot.config.schema import NotionToolConfig
         from nanobot.config.schema import WebSearchConfig
         self.provider = provider
         self.workspace = workspace
@@ -47,6 +50,7 @@ class SubagentManager:
         self.web_search_config = web_search_config or WebSearchConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.mineru_config = mineru_config or MineruConfig()
+        self.notion_config = notion_config or NotionToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
     
@@ -123,6 +127,11 @@ class SubagentManager:
                 search_type=self.web_search_config.search_type,
             ))
             tools.register(WebFetchTool())
+
+            tools.register(NotionTool(
+                config=self.notion_config,
+                allowed_dir=allowed_dir,
+            ))
 
             if self.mineru_config and self.mineru_config.enabled:
                 from nanobot.agent.tools.pdf_mineru import MineruPdfParseTool

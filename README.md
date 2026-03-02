@@ -145,6 +145,18 @@ Edit `~/.nanobot/config.json`:
       "api_key": "",
       "model_name": "gemini-3-pro-image-preview"
     },
+    "notion": {
+      "enabled": true,
+      "api_key": "secret_xxx",
+      "database_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "type_database_map": {
+        "notes": "",
+        "reports": "",
+        "log": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+        "research": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      },
+      "type_property": "Type"
+    },
     "restrictToWorkspace": false
   }
 }
@@ -197,6 +209,7 @@ Config file: `~/.nanobot/config.json`
 | Web Search | `tools.web.search` | `apiKey` ([Serper](https://serper.dev)) |
 | MinerU PDF | `tools.mineru` | `token` ([MinerU](https://mineru.net)) |
 | Image Generation | `tools.image_gen` | `apiBase`, `apiKey`, `modelName` |
+| Notion Dataset | `tools.notion` | `apiKey`, `databaseId` |
 
 ### 📡 Feishu Channel
 
@@ -258,6 +271,19 @@ Config file: `~/.nanobot/config.json`
       "api_base": "",
       "api_key": "",
       "model_name": "gemini-3-pro-image-preview"
+    },
+    "notion": {
+      "enabled": true,
+      "api_key": "",
+      "database_id": "",
+      "type_database_map": {
+        "notes": "",
+        "reports": "",
+        "log": "",
+        "research": "",
+        "archive": ""
+      },
+      "type_property": "Type"
     },
     "restrictToWorkspace": false
   }

@@ -129,6 +129,22 @@ class ImageGenConfig(BaseModel):
     timeout: int = 120
 
 
+class NotionToolConfig(BaseModel):
+    """Notion tool configuration."""
+    enabled: bool = True
+    api_key: str = ""
+    database_id: str = ""  # Fallback/default database
+    type_database_map: dict[str, str] = Field(default_factory=dict)
+    notion_version: str = "2022-06-28"
+    timeout: int = 30
+    title_property: str = "Name"
+    type_property: str = "Type"
+    source_path_property: str = "Source Path"
+    file_name_property: str = "File Name"
+    content_property: str = "Content"
+    max_content_chars: int = 4000
+
+
 class ToolHistoryConfig(BaseModel):
     """Tool history compression configuration for LLM context."""
     max_events: int = 5
@@ -142,6 +158,7 @@ class ToolsConfig(BaseModel):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     mineru: MineruConfig = Field(default_factory=MineruConfig)
     image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
+    notion: NotionToolConfig = Field(default_factory=NotionToolConfig)
     tool_history: ToolHistoryConfig = Field(default_factory=ToolHistoryConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 

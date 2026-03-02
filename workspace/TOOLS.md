@@ -94,6 +94,44 @@ Send a message to the user (used internally).
 message(content: str, channel: str = None, chat_id: str = None) -> str
 ```
 
+## Notion Dataset Management
+
+### notion
+Manage one authorized Notion database as a dataset store.
+```
+notion(
+    action: str,
+    path: str = None,
+    doc_type: str = "auto",
+    title: str = None,
+    page_id: str = None,
+    limit: int = 10,
+    include_content: bool = True
+) -> str
+```
+
+**Actions:**
+- `inspect_database`: Read current database title/properties/sample items
+- `ensure_partitions`: Ensure `notes` / `reports` options exist in the configured type property
+- `upload_file`: Upload a local file into the dataset database as one page entry
+- `list_items`: List recent items (optionally filtered by `doc_type`)
+- `reclassify_item`: Move one existing item to another partition type
+
+**Single-Database Mode**
+- Configure exactly one `databaseId` under `tools.notion`
+- Partitioning happens **inside** this database via a type property (default: `Type`)
+
+**Dynamic Routing (Recommended)**
+- Configure `typeDatabaseMap` as `{ "notes": "...", "reports": "...", "log": "..." }`
+- After that, adding/removing databases only requires editing config
+- The tool resolves upload/list/inspect targets dynamically from the map (fallback to `databaseId`)
+- `notes` / `reports` are just ordinary type keys, same as `log` or any custom key
+
+**Markdown Rendering**
+- `.md` / `.markdown` uploads are converted to Notion blocks
+- Supported: heading(1/2/3), paragraph (bold/italic/inline code), bullet list, numbered list, quote, divider, fenced code, table
+- Long content is split across multiple blocks to avoid Notion rich_text length limits
+
 ## Background Tasks
 
 ### spawn
