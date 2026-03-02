@@ -118,6 +118,7 @@ class MineruConfig(BaseModel):
     model_version: str = "vlm"
     timeout: int = 100
     poll_interval: int = 5
+    output_dir: str = ""  # persistent dir for extracted results; empty = use temp dir
 
 
 class ImageGenConfig(BaseModel):
