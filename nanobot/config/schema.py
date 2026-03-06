@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from nanobot.utils.helpers import expand_path, get_data_path, get_workspace_path
+
 
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
@@ -28,7 +30,7 @@ class FeishuConfig(BaseModel):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-    media_dir: str = "~/.nanobot/media"  # Directory to save received media files
+    media_dir: str = Field(default_factory=lambda: str(get_data_path() / "media"))  # Directory to save received media files
 
 
 class DiscordConfig(BaseModel):
@@ -50,7 +52,7 @@ class ChannelsConfig(BaseModel):
 
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = Field(default_factory=lambda: str(get_workspace_path()))
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
@@ -128,6 +130,11 @@ class ImageGenConfig(BaseModel):
     api_key: str = ""
     model_name: str = ""
     timeout: int = 120
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
+    retry_backoff_multiplier: float = 2.0
+    retry_max_backoff_seconds: float = 8.0
+    retry_status_codes: list[int] = Field(default_factory=lambda: [408, 409, 425, 429, 500, 502, 503, 504])
 
 
 class CloudinaryConfig(BaseModel):
@@ -187,7 +194,7 @@ class Config(BaseSettings):
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        return expand_path(self.agents.defaults.workspace)
     
     def _match_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Match a provider based on model name."""

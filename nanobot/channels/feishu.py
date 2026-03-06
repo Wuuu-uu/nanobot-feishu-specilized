@@ -17,6 +17,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
+from nanobot.utils.helpers import get_media_path
 
 try:
     import lark_oapi as lark
@@ -69,7 +70,7 @@ class FeishuChannel(BaseChannel):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tenant_access_token: str | None = None
         self._tenant_access_token_expire_at: float = 0.0
-        self._media_dir = Path(self.config.media_dir).expanduser()
+        self._media_dir = get_media_path(self.config.media_dir)
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""

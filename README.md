@@ -100,7 +100,13 @@ nanobot onboard
 
 ### 3. Configure
 
-Edit `~/.nanobot/config.json`:
+By default nanobot stores data in `~/.nanobot`. If you moved it, set `NANOBOT_HOME` first, for example:
+
+```bash
+export NANOBOT_HOME=/data/home/scwb307/run/.nanobot
+```
+
+Then edit the config file inside that directory, for example `/data/home/scwb307/run/.nanobot/config.json`:
 
 ```json
 {
@@ -143,7 +149,13 @@ Edit `~/.nanobot/config.json`:
     "image_gen": {
       "api_base": "",
       "api_key": "",
-      "model_name": "gemini-3-pro-image-preview"
+      "model_name": "gemini-3-pro-image-preview",
+      "timeout": 120,
+      "retry_attempts": 3,
+      "retry_backoff_seconds": 1.0,
+      "retry_backoff_multiplier": 2.0,
+      "retry_max_backoff_seconds": 8.0,
+      "retry_status_codes": [408, 409, 425, 429, 500, 502, 503, 504]
     },
     "notion": {
       "enabled": true,
@@ -189,7 +201,7 @@ nanobot agent -m "Hello!"
 
 ## Configuration Reference
 
-Config file: `~/.nanobot/config.json`
+Config file: `~/.nanobot/config.json` by default, or `$NANOBOT_HOME/config.json` when `NANOBOT_HOME` is set
 
 ### 🔌 Providers
 
@@ -220,7 +232,7 @@ Config file: `~/.nanobot/config.json`
 | `encryptKey` | Encrypt Key (optional for WebSocket mode) |
 | `verificationToken` | Verification Token (optional for WebSocket mode) |
 | `allowFrom` | Allowed user `open_id` list; empty = allow all |
-| `mediaDir` | Directory to save received media (default: `~/.nanobot/media`) |
+| `mediaDir` | Directory to save received media (default: `~/.nanobot/media`, or `$NANOBOT_HOME/media` when set) |
 
 <details>
 <summary><b>Full config example</b></summary>
@@ -229,7 +241,7 @@ Config file: `~/.nanobot/config.json`
 {
   "agents": {
     "defaults": {
-      "workspace": "~/.nanobot/workspace",
+      "workspace": "$NANOBOT_HOME/workspace",
       "model": "openai/Claude-Sonnet-4.5",
       "maxTokens": 10240,
       "temperature": 0.7,
@@ -270,7 +282,13 @@ Config file: `~/.nanobot/config.json`
     "image_gen": {
       "api_base": "",
       "api_key": "",
-      "model_name": "gemini-3-pro-image-preview"
+      "model_name": "gemini-3-pro-image-preview",
+      "timeout": 120,
+      "retry_attempts": 3,
+      "retry_backoff_seconds": 1.0,
+      "retry_backoff_multiplier": 2.0,
+      "retry_max_backoff_seconds": 8.0,
+      "retry_status_codes": [408, 409, 425, 429, 500, 502, 503, 504]
     },
     "notion": {
       "enabled": true,

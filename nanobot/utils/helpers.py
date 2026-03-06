@@ -1,7 +1,8 @@
 """Utility functions for nanobot."""
 
-from pathlib import Path
+import os
 from datetime import datetime
+from pathlib import Path
 
 
 def ensure_dir(path: Path) -> Path:
@@ -10,9 +11,31 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def expand_path(path: str | Path) -> Path:
+    """Expand environment variables and user home in a path."""
+    return Path(os.path.expandvars(str(path))).expanduser()
+
+
+def get_nanobot_home_path() -> Path:
+    """Get the nanobot data root, overridable with NANOBOT_HOME."""
+    configured = os.getenv("NANOBOT_HOME")
+    if configured:
+        return expand_path(configured)
+
+    legacy_home = Path.home() / ".nanobot"
+    migrated_home = Path.home() / "run" / ".nanobot"
+
+    # Migration fallback: prefer the new location when it has a config file
+    # and the legacy directory does not.
+    if not (legacy_home / "config.json").exists() and (migrated_home / "config.json").exists():
+        return migrated_home
+
+    return legacy_home
+
+
 def get_data_path() -> Path:
-    """Get the nanobot data directory (~/.nanobot)."""
-    return ensure_dir(Path.home() / ".nanobot")
+    """Get the nanobot data directory."""
+    return ensure_dir(get_nanobot_home_path())
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
@@ -20,21 +43,33 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     Get the workspace path.
     
     Args:
-        workspace: Optional workspace path. Defaults to ~/.nanobot/workspace.
+        workspace: Optional workspace path. Defaults to <nanobot_home>/workspace.
     
     Returns:
         Expanded and ensured workspace path.
     """
     if workspace:
-        path = Path(workspace).expanduser()
+        path = expand_path(workspace)
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = get_nanobot_home_path() / "workspace"
     return ensure_dir(path)
 
 
 def get_sessions_path() -> Path:
     """Get the sessions storage directory."""
     return ensure_dir(get_data_path() / "sessions")
+
+
+def get_media_path(media_dir: str | None = None) -> Path:
+    """Get the media storage directory."""
+    if media_dir:
+        return ensure_dir(expand_path(media_dir))
+    return ensure_dir(get_data_path() / "media")
+
+
+def get_bridge_path() -> Path:
+    """Get the bridge directory."""
+    return ensure_dir(get_data_path() / "bridge")
 
 
 def get_memory_path(workspace: Path | None = None) -> Path:

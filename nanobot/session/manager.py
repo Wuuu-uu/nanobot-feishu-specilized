@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, safe_filename, truncate_string
+from nanobot.utils.helpers import ensure_dir, get_sessions_path, safe_filename, truncate_string
 
 
 @dataclass
@@ -191,7 +191,7 @@ class SessionManager:
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(Path.home() / ".nanobot" / "sessions")
+        self.sessions_dir = get_sessions_path()
         self._cache: dict[str, Session] = {}
         self._active_path = self.sessions_dir / "_active.json"
         self._active_map = self._load_active_map()

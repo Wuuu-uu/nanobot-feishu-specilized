@@ -20,11 +20,12 @@ import requests
 
 from nanobot.agent.tools.base import Tool
 from nanobot.config.schema import MineruConfig
+from nanobot.utils.helpers import expand_path, get_workspace_path
 
 logger = logging.getLogger(__name__)
 
 # Default persistent output directory (under workspace)
-_DEFAULT_OUTPUT_DIR = Path.home() / ".nanobot" / "workspace" / "mineru_outputs"
+_DEFAULT_OUTPUT_DIR = get_workspace_path() / "mineru_outputs"
 
 
 class MineruPdfParseTool(Tool):
@@ -42,7 +43,7 @@ class MineruPdfParseTool(Tool):
         self._allowed_dir = allowed_dir
         # Resolve output directory
         if config.output_dir:
-            self._output_root = Path(config.output_dir)
+            self._output_root = expand_path(config.output_dir)
         else:
             self._output_root = _DEFAULT_OUTPUT_DIR
 

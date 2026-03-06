@@ -10,7 +10,7 @@
  *   npm run build && npm start
  *   
  * Or with custom settings:
- *   BRIDGE_PORT=3001 AUTH_DIR=~/.nanobot/whatsapp npm start
+ *   NANOBOT_HOME=/path/to/.nanobot BRIDGE_PORT=3001 AUTH_DIR=/path/to/.nanobot/whatsapp-auth npm start
  */
 
 // Polyfill crypto for Baileys in ESM
@@ -24,7 +24,8 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
-const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
+const NANOBOT_HOME = process.env.NANOBOT_HOME || join(homedir(), '.nanobot');
+const AUTH_DIR = process.env.AUTH_DIR || join(NANOBOT_HOME, 'whatsapp-auth');
 
 console.log('🐈 nanobot WhatsApp Bridge');
 console.log('========================\n');

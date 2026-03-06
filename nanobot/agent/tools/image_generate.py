@@ -201,9 +201,54 @@ class ImageGenerateTool(Tool):
 			"Content-Type": "application/json",
 		}
 
+		max_attempts = max(1, self.config.retry_attempts)
+		retry_status_codes = set(self.config.retry_status_codes)
+		backoff = max(0.0, self.config.retry_backoff_seconds)
+		last_error: Exception | None = None
+
 		async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-			response = await client.post(url, json=payload, headers=headers)
-			response.raise_for_status()
+			for attempt in range(1, max_attempts + 1):
+				try:
+					response = await client.post(url, json=payload, headers=headers)
+				except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+					last_error = e
+					if attempt >= max_attempts:
+						msg = str(e) or type(e).__name__
+						raise RuntimeError(
+							f"request failed after {max_attempts} attempts: {msg}"
+						) from e
+					if backoff > 0:
+						await asyncio.sleep(backoff)
+						backoff = min(
+							max(0.0, self.config.retry_max_backoff_seconds),
+							backoff * max(1.0, self.config.retry_backoff_multiplier),
+						)
+					continue
+
+				try:
+					response.raise_for_status()
+				except httpx.HTTPStatusError as e:
+					last_error = e
+					status_code = e.response.status_code
+					if status_code in retry_status_codes and attempt < max_attempts:
+						if backoff > 0:
+							await asyncio.sleep(backoff)
+							backoff = min(
+								max(0.0, self.config.retry_max_backoff_seconds),
+								backoff * max(1.0, self.config.retry_backoff_multiplier),
+							)
+						continue
+
+					body = (e.response.text or "").strip().replace("\n", " ")
+					if len(body) > 160:
+						body = body[:160] + "..."
+					raise RuntimeError(f"http {status_code}: {body}") from e
+
+				break
+			else:
+				if last_error:
+					raise RuntimeError(str(last_error)) from last_error
+				raise RuntimeError("request failed without response")
 
 		data = response.json()
 		image_match = _extract_image_from_payload(data)

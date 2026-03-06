@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.config.schema import Config
+from nanobot.utils.helpers import get_nanobot_home_path
 
 
 def get_config_path() -> Path:
     """Get the default configuration file path."""
-    return Path.home() / ".nanobot" / "config.json"
+    return get_nanobot_home_path() / "config.json"
 
 
 def get_data_dir() -> Path:
@@ -69,6 +70,32 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    data = _rewrite_legacy_default_paths(data)
+    return data
+
+
+def _rewrite_legacy_default_paths(data: Any) -> Any:
+    """Rewrite legacy ~/.nanobot defaults when NANOBOT_HOME points elsewhere."""
+    new_home = get_nanobot_home_path()
+    legacy_home = Path.home() / ".nanobot"
+
+    if new_home == legacy_home:
+        return data
+
+    replacements = {
+        "~/.nanobot/workspace": str(new_home / "workspace"),
+        str(legacy_home / "workspace"): str(new_home / "workspace"),
+        "~/.nanobot/media": str(new_home / "media"),
+        str(legacy_home / "media"): str(new_home / "media"),
+    }
+
+    if isinstance(data, dict):
+        return {key: _rewrite_legacy_default_paths(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_rewrite_legacy_default_paths(item) for item in data]
+    if isinstance(data, str):
+        return replacements.get(data, data)
     return data
 
 
