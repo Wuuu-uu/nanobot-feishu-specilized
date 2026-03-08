@@ -3,11 +3,13 @@
 import asyncio
 import json
 import mimetypes
+import re
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -181,7 +183,7 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
             
-            # Build rich text (post) message content
+            # Prepare outbound message payload and media uploads
             image_keys: list[str] = []
             file_keys: list[str] = []
             if msg.media:
@@ -196,21 +198,28 @@ class FeishuChannel(BaseChannel):
                     except Exception as e:
                         logger.warning(f"Failed to upload media {media_path}: {e}")
 
-            title = msg.metadata.get("title") if isinstance(msg.metadata, dict) else None
-            if msg.content or image_keys:
-                post_content = self._build_post_content(
-                    msg.content,
-                    image_keys,
-                    title=title or "🐈Nanobot: ",
+            if msg.content:
+                template_id = self.config.card_template_id
+                template_version_name = self.config.card_template_version_name
+                if isinstance(msg.metadata, dict):
+                    template_id = msg.metadata.get("template_id", template_id)
+                    template_version_name = msg.metadata.get("template_version_name", template_version_name)
+
+                # Replace local markdown image paths with uploaded Feishu image keys.
+                card_text = await self._replace_local_md_images_with_keys(msg.content)
+
+                content = self._build_interactive_content(
+                    card_text,
+                    template_id=template_id,
+                    template_version_name=template_version_name,
                 )
-                content = json.dumps(post_content, ensure_ascii=False)
 
                 request = CreateMessageRequest.builder() \
                     .receive_id_type(receive_id_type) \
                     .request_body(
                         CreateMessageRequestBody.builder()
                         .receive_id(msg.chat_id)
-                        .msg_type("post")
+                        .msg_type("interactive")
                         .content(content)
                         .build()
                     ).build()
@@ -224,6 +233,9 @@ class FeishuChannel(BaseChannel):
                     )
                 else:
                     logger.debug(f"Feishu message sent to {msg.chat_id}")
+
+            for image_key in image_keys:
+                await self._send_image_message(image_key, msg.chat_id, receive_id_type)
 
             for file_key in file_keys:
                 await self._send_file_message(file_key, msg.chat_id, receive_id_type)
@@ -309,6 +321,22 @@ class FeishuChannel(BaseChannel):
         if not response.success():
             raise RuntimeError(f"file message send failed: code={response.code}, msg={response.msg}")
 
+    async def _send_image_message(self, image_key: str, chat_id: str, receive_id_type: str) -> None:
+        content = json.dumps({"image_key": image_key}, ensure_ascii=False)
+        request = CreateMessageRequest.builder() \
+            .receive_id_type(receive_id_type) \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("image")
+                .content(content)
+                .build()
+            ).build()
+
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            raise RuntimeError(f"image message send failed: code={response.code}, msg={response.msg}")
+
     @staticmethod
     def _file_type_from_path(path: Path) -> str:
         ext = path.suffix.lower().lstrip(".")
@@ -327,69 +355,93 @@ class FeishuChannel(BaseChannel):
         mime = mimetypes.guess_type(file_path)[0] or ""
         return mime.startswith("image/")
 
+    def _resolve_local_md_image_path(self, markdown_url: str) -> Path | None:
+        """Resolve a markdown image url to an existing local image path, if possible."""
+        raw = markdown_url.strip()
+        if not raw:
+            return None
+
+        # Markdown image url may include optional title: ![alt](url "title")
+        if raw.startswith("<") and ">" in raw:
+            raw = raw[1:raw.find(">")]
+        else:
+            raw = raw.split(maxsplit=1)[0]
+
+        lowered = raw.lower()
+        if lowered.startswith(("http://", "https://", "data:")):
+            return None
+        if raw.startswith("img_v"):
+            return None
+
+        if lowered.startswith("file://"):
+            parsed = urlparse(raw)
+            candidate = Path(unquote(parsed.path)).expanduser()
+        else:
+            candidate = Path(unquote(raw)).expanduser()
+
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates.append(Path.cwd() / candidate)
+            candidates.append(self._media_dir / candidate)
+
+        for path in candidates:
+            if path.exists() and path.is_file() and self._is_image(str(path)):
+                return path
+        return None
+
+    async def _replace_local_md_images_with_keys(self, text: str) -> str:
+        """Upload local markdown images and replace their paths with Feishu image keys."""
+        pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+        matches = list(pattern.finditer(text))
+        if not matches:
+            return text
+
+        upload_cache: dict[str, str] = {}
+        parts: list[str] = []
+        last = 0
+
+        for match in matches:
+            parts.append(text[last:match.start()])
+            alt_text = match.group(1)
+            raw_url = match.group(2)
+
+            replacement = match.group(0)
+            local_path = self._resolve_local_md_image_path(raw_url)
+            if local_path:
+                key = upload_cache.get(str(local_path))
+                if key is None:
+                    try:
+                        key = self._upload_image(str(local_path))
+                        upload_cache[str(local_path)] = key
+                    except Exception as e:
+                        logger.warning(f"Failed to upload markdown image {local_path}: {e}")
+                        key = None
+                if key:
+                    replacement = f"![{alt_text}]({key})"
+
+            parts.append(replacement)
+            last = match.end()
+
+        parts.append(text[last:])
+        return "".join(parts)
+
     @staticmethod
-    def _wrap_md_tables_in_code_blocks(text: str) -> str:
-        """Wrap Markdown pipe-tables in code blocks.
-
-        Feishu post ``md`` tag does NOT render Markdown tables – the pipe
-        characters and separator lines are silently swallowed.  This helper
-        detects contiguous runs of table rows (lines starting/ending with ``|``
-        or separator lines like ``|---|``) and wraps each run in a fenced code
-        block so the table is at least displayed with monospace alignment.
-        """
-        import re
-
-        lines = text.split("\n")
-        result: list[str] = []
-        table_buf: list[str] = []
-
-        def _is_table_line(line: str) -> bool:
-            stripped = line.strip()
-            if not stripped:
-                return False
-            # Standard MD table row: starts with |
-            if stripped.startswith("|"):
-                return True
-            # Some tables omit leading |, detect separator: ---|----|---
-            if re.match(r"^[\s|:?-]+$", stripped) and "|" in stripped:
-                return True
-            return False
-
-        def _flush_table() -> None:
-            if table_buf:
-                result.append("```")
-                result.extend(table_buf)
-                result.append("```")
-                table_buf.clear()
-
-        for line in lines:
-            if _is_table_line(line):
-                table_buf.append(line)
-            else:
-                _flush_table()
-                result.append(line)
-        _flush_table()
-
-        return "\n".join(result)
-
-    @staticmethod
-    def _build_post_content(text: str, image_keys: list[str], title: str) -> dict[str, Any]:
-        content_rows: list[list[dict[str, Any]]] = []
-        if text:
-            text = FeishuChannel._wrap_md_tables_in_code_blocks(text)
-            content_rows.append([{"tag": "md", "text": text}])
-        for image_key in image_keys:
-            content_rows.append([{"tag": "img", "image_key": image_key}])
-
-        if not content_rows:
-            content_rows = [[{"tag": "md", "text": "[empty message]"}]]
-
-        return {
-            "zh_cn": {
-                "title": title,
-                "content": content_rows,
-            }
+    def _build_interactive_content(
+        text: str,
+        template_id: str,
+        template_version_name: str,
+    ) -> str:
+        payload = {
+            "type": "template",
+            "data": {
+                "template_id": template_id,
+                "template_version_name": template_version_name,
+                "template_variable": {
+                    "content": text,
+                },
+            },
         }
+        return json.dumps(payload, ensure_ascii=False)
     
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """

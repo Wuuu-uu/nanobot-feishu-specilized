@@ -2,6 +2,7 @@
 
 import base64
 import mimetypes
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -40,7 +41,10 @@ class MessageTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Send a message to the user. Use this when you want to communicate something, send local pictures or local files to the user."
+        return (
+            "Send a message to the user. Message types are: rich markdown content "
+            "(text/image/mixed) and file messages."
+        )
     
     @property
     def parameters(self) -> dict[str, Any]:
@@ -54,15 +58,15 @@ class MessageTool(Tool):
                 "media": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional local file paths for media (images) to send"
+                    "description": "Optional local file paths. Images are merged into markdown content; non-images are sent as files."
                 },
                 "image_path": {
                     "type": "string",
-                    "description": "Optional local image path to send"
+                    "description": "Optional local image path (legacy). It will be merged into markdown content as ![image](ABSOLUTE_PATH)."
                 },
                 "image_base64": {
                     "type": "string",
-                    "description": "Optional base64 image data or data URI"
+                    "description": "Optional base64 image data (legacy). It will be saved locally and merged into markdown content."
                 },
                 "image_mime_type": {
                     "type": "string",
@@ -126,15 +130,25 @@ class MessageTool(Tool):
             return "Error: Message sending not configured"
         
         content = content or ""
-        media_paths = list(media or [])
+        media_paths: list[str] = []
+
+        # Merge legacy media list into new two-category model.
+        for path in media or []:
+            if self._is_local_image(path):
+                abs_path = str(Path(path).expanduser().resolve())
+                content = f"{content}\n\n![image]({abs_path})" if content else f"![image]({abs_path})"
+            else:
+                media_paths.append(path)
 
         if image_path:
-            media_paths.append(image_path)
+            abs_path = str(Path(image_path).expanduser().resolve())
+            content = f"{content}\n\n![image]({abs_path})" if content else f"![image]({abs_path})"
 
         if image_base64:
             try:
                 saved_path = self._save_base64_image(image_base64, image_mime_type)
-                media_paths.append(saved_path)
+                abs_path = str(Path(saved_path).expanduser().resolve())
+                content = f"{content}\n\n![image]({abs_path})" if content else f"![image]({abs_path})"
             except Exception as e:
                 return f"Error: failed to save base64 image: {str(e)}"
 
@@ -148,10 +162,16 @@ class MessageTool(Tool):
             except Exception as e:
                 return f"Error: failed to save base64 file: {str(e)}"
 
+        md_image_error = self._validate_markdown_image_paths(content)
+        if md_image_error:
+            return md_image_error
+
         if not content and not media_paths:
             return "Error: No content or media provided"
 
-        metadata = {"title": title} if title else {}
+        metadata: dict[str, Any] = {}
+        if title:
+            metadata["title"] = title
 
         msg = OutboundMessage(
             channel=channel,
@@ -166,6 +186,32 @@ class MessageTool(Tool):
             return f"Message sent to {channel}:{chat_id}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+    @staticmethod
+    def _is_local_image(path: str) -> bool:
+        mime = mimetypes.guess_type(path)[0] or ""
+        return mime.startswith("image/")
+
+    @staticmethod
+    def _validate_markdown_image_paths(content: str) -> str | None:
+        """Require absolute local paths in markdown image links to avoid key-resolution errors."""
+        pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+        for match in pattern.finditer(content):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            link = raw.split(maxsplit=1)[0]
+            lower = link.lower()
+            if lower.startswith(("http://", "https://", "data:", "file://")):
+                continue
+            if link.startswith("img_v"):
+                continue
+            if not Path(link).is_absolute():
+                return (
+                    "Error: markdown image link must use absolute local path, "
+                    f"got relative path: {link}"
+                )
+        return None
 
     def _save_base64_image(self, data: str, mime_type: str | None = None) -> str:
         """Decode base64 image data to a file and return the path."""

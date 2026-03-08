@@ -91,8 +91,25 @@ parse_pdf_mineru(path: str, timeout: int = None, poll_interval: int = None) -> s
 ### message
 Send a message to the user (used internally).
 ```
-message(content: str, channel: str = None, chat_id: str = None) -> str
+message(
+    content: str = None,
+    media: list[str] = None,
+    image_path: str = None,
+    image_base64: str = None,
+    file_path: str = None,
+    file_base64: str = None,
+    file_name: str = None,
+    channel: str = None,
+    chat_id: str = None
+) -> str
 ```
+
+Message categories:
+- Rich text: pass markdown in `content` (text/image/mixed).
+- File message: pass file paths via `file_path` or non-image entries in `media`.
+
+For markdown images, use absolute local paths to avoid image-key resolution errors:
+- `![ProteoGPT](/data/run01/scwb307/.nanobot/workspace/reports/weekly-0307/images/ampgenix_fig1_nat.png)`
 
 ## Notion Dataset Management
 

@@ -31,6 +31,8 @@ class FeishuConfig(BaseModel):
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     media_dir: str = Field(default_factory=lambda: str(get_data_path() / "media"))  # Directory to save received media files
+    card_template_id: str = "AAqK6dMNHUVKE"  # Feishu card template id for outbound interactive messages
+    card_template_version_name: str = "1.0.0"  # Card template version used for outbound interactive messages
 
 
 class DiscordConfig(BaseModel):
