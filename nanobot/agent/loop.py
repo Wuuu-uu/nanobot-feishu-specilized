@@ -298,7 +298,7 @@ class AgentLoop:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)  # Must be JSON string
                         }
                     }
                     for tc in response.tool_calls
@@ -312,7 +312,7 @@ class AgentLoop:
                 
                 # Execute tools
                 for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, indent=2)
+                    args_str = json.dumps(tool_call.arguments, indent=2, ensure_ascii=False)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     push_message = OutboundMessage(
                         channel=msg.channel,
@@ -431,7 +431,7 @@ class AgentLoop:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
                         }
                     }
                     for tc in response.tool_calls
@@ -444,7 +444,7 @@ class AgentLoop:
                 session.add_message("assistant", response.content, tool_calls=tool_call_dicts)
                 
                 for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     started = time.perf_counter()
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)

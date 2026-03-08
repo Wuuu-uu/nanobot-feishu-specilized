@@ -210,7 +210,7 @@ class SessionManager:
     def _save_active_map(self) -> None:
         try:
             self._active_path.write_text(
-                json.dumps(self._active_map, ensure_ascii=True, indent=2),
+                json.dumps(self._active_map, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception as e:
