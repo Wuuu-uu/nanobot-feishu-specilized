@@ -66,10 +66,21 @@ web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 ## PDF Parsing (MinerU)
 
 ### parse_pdf_mineru
-Parse a local PDF via MinerU KIE and return extracted text with metadata.
+Parse local files or URLs via MinerU batch APIs and return extracted text with metadata.
 ```
-parse_pdf_mineru(path: str, timeout: int = None, poll_interval: int = None) -> str
+parse_pdf_mineru(
+    urls: list[str] = None,
+    paths: list[str] = None,
+    model_version: str = None,
+    timeout: int = None,
+    poll_interval: int = None
+) -> str
 ```
+
+Input modes (cannot mix local + URL in one call):
+- URL mode: `urls` (batch up to 200)
+- Local mode: `paths` (batch up to 200)
+- Single-file case: pass a one-item list, e.g. `urls=["https://..."]` or `paths=["/abs/a.pdf"]`
 
 **Config required:**
 ```json
@@ -77,10 +88,12 @@ parse_pdf_mineru(path: str, timeout: int = None, poll_interval: int = None) -> s
     "tools": {
         "mineru": {
             "enabled": true,
-            "baseUrl": "https://mineru.net/api/kie",
-            "pipelineId": "YOUR_PIPELINE_ID",
-            "timeout": 60,
-            "pollInterval": 5
+            "api_url": "https://mineru.net/api/v4/extract/task",
+            "token": "YOUR_MINERU_TOKEN",
+            "model_version": "vlm",
+            "timeout": 100,
+            "poll_interval": 5,
+            "output_dir": ""
         }
     }
 }

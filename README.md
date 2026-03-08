@@ -18,11 +18,14 @@ This fork introduces the following modifications on top of the original nanobot 
 
 ### 1. 📄 New Tool: `parse_pdf_mineru`
 
-A PDF parsing tool powered by the [MinerU](https://mineru.net) KIE HTTP API. It accepts a public PDF URL, submits it to the MinerU service for extraction, polls for completion, and returns the full Markdown content with metadata.
+A document parsing tool powered by the [MinerU](https://mineru.net) v4 batch APIs. It supports both batch URL parsing and batch local-file uploading, then polls batch results and returns extracted Markdown with metadata.
 
+- Supports batch URL mode (`extract/task/batch`) and batch local upload mode (`file-urls/batch` + PUT upload)
+- LLM-facing parameters are intentionally minimal to avoid context explosion: `urls`, `paths`, `model_version`, `timeout`, `poll_interval`
+- Single-file parsing is handled by batch mode (pass a one-item `urls` or `paths` list)
 - Asynchronous polling with configurable timeout and interval
-- Supports model version override (e.g. `vlm`)
-- Downloads and extracts `full.md` from the result ZIP archive
+- Supports model version override (`pipeline`/`vlm`/`MinerU-HTML`) and common MinerU options
+- Downloads and extracts each `full.md` and `images/` from result ZIP archives
 - Configured via `tools.mineru` in `config.json`
 
 ### 2. 🖼️ New Tool: `image_generate`

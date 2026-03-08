@@ -318,7 +318,7 @@ class AgentLoop:
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=(
-                            f"🛠️**正在调用工具**： `{tool_call.name}`\n\n"
+                            f"🛠️**正在调用工具**： `{tool_call.name}`\n"
                             f"🔢**参数列表**：\n"
                             f"```json\n{args_str}\n```"
                         )

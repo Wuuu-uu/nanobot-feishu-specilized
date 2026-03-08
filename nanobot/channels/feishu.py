@@ -500,6 +500,19 @@ class FeishuChannel(BaseChannel):
                         content = "[image: download failed]"
                 else:
                     content = "[image: missing image_key]"
+            elif msg_type == "file":
+                file_key, file_name = self._extract_file_info(message.content)
+                if file_key:
+                    try:
+                        saved_path = await self._download_file_resource(message_id, file_key, file_name)
+                        media_paths.append(str(saved_path))
+                        content = f"[file: {saved_path}]"
+                    except Exception as e:
+                        logger.warning(f"Failed to download Feishu file: {e}")
+                        fallback_name = file_name or file_key
+                        content = f"[file: download failed ({fallback_name})]"
+                else:
+                    content = "[file: missing file_key]"
             else:
                 content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
             
@@ -571,6 +584,27 @@ class FeishuChannel(BaseChannel):
         file_path.write_bytes(response.content)
         return file_path
 
+    async def _download_file_resource(self, message_id: str, file_key: str, file_name: str | None = None) -> Path:
+        """Download a file resource and save it to the media directory."""
+        token = await self._get_tenant_access_token()
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(url, params={"type": "file"}, headers=headers)
+            response.raise_for_status()
+
+        # Prefer name from message payload, fallback to Content-Disposition.
+        header_name = self._extract_filename_from_content_disposition(
+            response.headers.get("Content-Disposition", "")
+        )
+        effective_name = self._sanitize_filename(file_name or header_name or f"{file_key}.bin")
+
+        self._media_dir.mkdir(parents=True, exist_ok=True)
+        file_path = self._media_dir / f"{message_id}_{effective_name}"
+        file_path.write_bytes(response.content)
+        return file_path
+
     @staticmethod
     def _sanitize_filename(value: str) -> str:
         return "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_", ".")) or "file"
@@ -589,3 +623,34 @@ class FeishuChannel(BaseChannel):
             or data.get("imageKey")
             or data.get("fileKey")
         )
+
+    @staticmethod
+    def _extract_file_info(content: str | None) -> tuple[str | None, str | None]:
+        if not content:
+            return None, None
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None, None
+        file_key = data.get("file_key") or data.get("fileKey")
+        file_name = data.get("file_name") or data.get("fileName")
+        return file_key, file_name
+
+    @staticmethod
+    def _extract_filename_from_content_disposition(content_disposition: str) -> str | None:
+        if not content_disposition:
+            return None
+
+        # RFC5987 form: filename*=UTF-8''hello%20world.txt
+        extended = re.search(r"filename\*=([^;]+)", content_disposition, flags=re.IGNORECASE)
+        if extended:
+            raw = extended.group(1).strip().strip('"')
+            if "''" in raw:
+                _, encoded_name = raw.split("''", 1)
+                return unquote(encoded_name)
+            return unquote(raw)
+
+        basic = re.search(r"filename=([^;]+)", content_disposition, flags=re.IGNORECASE)
+        if basic:
+            return basic.group(1).strip().strip('"')
+        return None
