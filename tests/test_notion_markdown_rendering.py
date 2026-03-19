@@ -146,3 +146,130 @@ def test_code_language_alias_objective_c_maps_to_objective_c_dash() -> None:
     assert blocks[0]["type"] == "code"
     assert blocks[0]["code"]["language"] == "objective-c"
 
+
+
+# ---- Nested list tests ----
+
+
+def test_nested_list_numbered_with_bullet_children() -> None:
+    """Numbered list items with bullet sub-items should nest via children."""
+    tool = _make_tool()
+    md = (
+        "1. First\n"
+        "   - Sub A\n"
+        "   - Sub B\n"
+        "2. Second\n"
+        "   - Sub C\n"
+        "3. Third\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    # Should produce exactly 3 top-level numbered_list_item blocks
+    assert len(blocks) == 3
+    for b in blocks:
+        assert b["type"] == "numbered_list_item"
+
+    # First item has 2 children
+    c1 = blocks[0]["numbered_list_item"].get("children", [])
+    assert len(c1) == 2
+    assert c1[0]["type"] == "bulleted_list_item"
+    assert c1[1]["type"] == "bulleted_list_item"
+
+    # Second item has 1 child
+    c2 = blocks[1]["numbered_list_item"].get("children", [])
+    assert len(c2) == 1
+
+    # Third item has no children
+    c3 = blocks[2]["numbered_list_item"].get("children", [])
+    assert len(c3) == 0
+
+
+def test_nested_list_three_levels() -> None:
+    """Three levels of nesting (max Notion allows)."""
+    tool = _make_tool()
+    md = (
+        "- Level 0\n"
+        "  - Level 1\n"
+        "    - Level 2\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "bulleted_list_item"
+
+    children_1 = blocks[0]["bulleted_list_item"].get("children", [])
+    assert len(children_1) == 1
+
+    children_2 = children_1[0]["bulleted_list_item"].get("children", [])
+    assert len(children_2) == 1
+
+
+def test_nested_list_depth_clamped() -> None:
+    """Four indent levels should be clamped to 3 (Notion max)."""
+    tool = _make_tool()
+    md = (
+        "- L0\n"
+        "  - L1\n"
+        "    - L2\n"
+        "      - L3 (should clamp to L2)\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    assert len(blocks) == 1
+    c1 = blocks[0]["bulleted_list_item"]["children"]
+    assert len(c1) == 1
+    c2 = c1[0]["bulleted_list_item"]["children"]
+    # L2 and L3 both at depth 2, so L2's sibling L3 should be here
+    assert len(c2) == 2
+
+
+def test_nested_list_todo_items() -> None:
+    """To-do items should also nest properly."""
+    tool = _make_tool()
+    md = (
+        "- Parent\n"
+        "  - [x] Done task\n"
+        "  - [ ] Open task\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    assert len(blocks) == 1
+    children = blocks[0]["bulleted_list_item"]["children"]
+    assert len(children) == 2
+    assert children[0]["type"] == "to_do"
+    assert children[0]["to_do"]["checked"] is True
+    assert children[1]["type"] == "to_do"
+    assert children[1]["to_do"]["checked"] is False
+
+
+def test_nested_list_mixed_numbered_bullet() -> None:
+    """Mixed numbered and bulleted items at same level."""
+    tool = _make_tool()
+    md = (
+        "1. Numbered parent\n"
+        "   - Bullet child\n"
+        "   1. Numbered child\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    assert len(blocks) == 1
+    children = blocks[0]["numbered_list_item"]["children"]
+    assert len(children) == 2
+    assert children[0]["type"] == "bulleted_list_item"
+    assert children[1]["type"] == "numbered_list_item"
+
+
+def test_flat_list_unchanged() -> None:
+    """A flat list with no nesting should produce sibling blocks (no children)."""
+    tool = _make_tool()
+    md = (
+        "- Alpha\n"
+        "- Beta\n"
+        "- Gamma\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+
+    assert len(blocks) == 3
+    for b in blocks:
+        assert b["type"] == "bulleted_list_item"
+        assert "children" not in b["bulleted_list_item"]

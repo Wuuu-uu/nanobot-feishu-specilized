@@ -637,26 +637,23 @@ class NotionTool(Tool):
                 i += 1
                 continue
 
-            todo = re.match(r"^\s*[-*]\s+\[( |x|X)\]\s+(.+)$", line)
-            if todo:
+            # --- List items (bullet / numbered / todo) with nesting support ---
+            list_parsed = self._parse_list_item(line)
+            if list_parsed is not None:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
-                checked = todo.group(1).lower() == "x"
-                blocks.append(self._to_do_block(todo.group(2).strip(), checked=checked))
-                i += 1
-                continue
-
-            bullet = re.match(r"^\s*[-*]\s+(.+)$", line)
-            if bullet:
-                self._flush_paragraph_buffer(paragraph_buffer, blocks)
-                blocks.extend(self._text_blocks("bulleted_list_item", bullet.group(1).strip()))
-                i += 1
-                continue
-
-            numbered = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
-            if numbered:
-                self._flush_paragraph_buffer(paragraph_buffer, blocks)
-                blocks.extend(self._text_blocks("numbered_list_item", numbered.group(1).strip()))
-                i += 1
+                # Collect the full contiguous run of list lines starting at i
+                run_lines: list[str] = [line]
+                j = i + 1
+                while j < len(lines):
+                    nxt = lines[j]
+                    # Continue the run if the next line is also a list item
+                    if self._parse_list_item(nxt) is not None:
+                        run_lines.append(nxt)
+                        j += 1
+                    else:
+                        break
+                blocks.extend(self._build_nested_list_blocks(run_lines))
+                i = j
                 continue
 
             quote = re.match(r"^\s*>\s?(.*)$", line)
@@ -682,6 +679,116 @@ class NotionTool(Tool):
         if text:
             blocks.extend(self._text_blocks("paragraph", text))
         buffer.clear()
+
+    # ------------------------------------------------------------------
+    # List nesting helpers
+    # ------------------------------------------------------------------
+
+    _RE_TODO = re.compile(r"^(\s*)[-*]\s+\[( |x|X)\]\s+(.+)$")
+    _RE_BULLET = re.compile(r"^(\s*)[-*]\s+(.+)$")
+    _RE_NUMBERED = re.compile(r"^(\s*)\d+[.)]\s+(.+)$")
+
+    @staticmethod
+    def _parse_list_item(line: str):
+        """Return (indent: int, item_type: str, text: str, checked: bool|None) or None.
+
+        item_type is one of: 'bulleted_list_item', 'numbered_list_item', 'to_do'.
+        """
+        m = NotionTool._RE_TODO.match(line)
+        if m:
+            return (len(m.group(1)), "to_do", m.group(3).strip(), m.group(2).lower() == "x")
+        m = NotionTool._RE_NUMBERED.match(line)
+        if m:
+            return (len(m.group(1)), "numbered_list_item", m.group(2).strip(), None)
+        m = NotionTool._RE_BULLET.match(line)
+        if m:
+            return (len(m.group(1)), "bulleted_list_item", m.group(2).strip(), None)
+        return None
+
+    def _make_list_block(self, item_type: str, text: str, checked=None,
+                         children: list | None = None) -> dict[str, Any]:
+        """Create a single list-item block (optionally with children)."""
+        rich_text = self._inline_to_rich_text(text)
+        if not rich_text:
+            rich_text = self._inline_to_rich_text(" ")
+        body: dict[str, Any] = {"rich_text": rich_text}
+        if item_type == "to_do":
+            body["checked"] = bool(checked)
+        if children:
+            body["children"] = children
+        return {
+            "object": "block",
+            "type": item_type,
+            item_type: body,
+        }
+
+    def _build_nested_list_blocks(self, run_lines: list[str]) -> list[dict[str, Any]]:
+        """Parse a contiguous run of list lines and return nested Notion blocks.
+
+        Notion allows at most **2 levels of nesting** (children of children).
+        Deeper items are clamped to the deepest allowed level.
+        """
+        # Parse all items: (indent, type, text, checked)
+        items: list[tuple[int, str, str, bool | None]] = []
+        for ln in run_lines:
+            parsed = self._parse_list_item(ln)
+            if parsed is not None:
+                items.append(parsed)
+
+        if not items:
+            return []
+
+        # Determine indent levels: map raw indent values to 0, 1, 2 ...
+        unique_indents = sorted(set(it[0] for it in items))
+        indent_map = {raw: idx for idx, raw in enumerate(unique_indents)}
+
+        # Clamp to max 3 levels (0, 1, 2) because Notion allows top + 2 nesting
+        _MAX_DEPTH = 3  # levels 0, 1, 2
+        normalised: list[tuple[int, str, str, bool | None]] = [
+            (min(indent_map[it[0]], _MAX_DEPTH - 1), it[1], it[2], it[3])
+            for it in items
+        ]
+
+        # Build tree iteratively using a stack.
+        # Stack entries: (level, block_dict, children_list_ref)
+        # We build top-level results and attach children in-place.
+        top_blocks: list[dict[str, Any]] = []
+
+        # Stack tracks the "path" of ancestors.  Each entry is
+        # (level, children_list) where children_list is the list that
+        # the item was appended to (so siblings go into the same list).
+        stack: list[tuple[int, list[dict[str, Any]]]] = []
+
+        for level, itype, itext, ichecked in normalised:
+            block = self._make_list_block(itype, itext, checked=ichecked)
+
+            if level == 0:
+                # Top-level item
+                top_blocks.append(block)
+                stack = [(0, top_blocks)]
+            else:
+                # Pop stack until we find the parent level (< current level)
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+
+                if not stack:
+                    # Safety fallback: treat as top-level
+                    top_blocks.append(block)
+                    stack = [(0, top_blocks)]
+                else:
+                    # Attach as child of the last block in the parent's list
+                    parent_list = stack[-1][1]
+                    parent_block = parent_list[-1]
+                    parent_type = parent_block["type"]
+                    if "children" not in parent_block[parent_type]:
+                        parent_block[parent_type]["children"] = []
+                    children_ref = parent_block[parent_type]["children"]
+                    children_ref.append(block)
+                    stack.append((level, children_ref))
+
+        return top_blocks
+
+    # ------------------------------------------------------------------
 
     def _text_blocks(self, block_type: str, text: str) -> list[dict[str, Any]]:
         rich_text = self._inline_to_rich_text(text)
