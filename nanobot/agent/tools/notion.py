@@ -28,10 +28,14 @@ _TEXT_EXTENSIONS = {
 _MAX_RICH_TEXT_CHARS = 1900
 _MAX_APPEND_BLOCKS = 80
 _INLINE_PATTERN = re.compile(
-    r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)"   # inline math $...$
-    r"|(`[^`]+`)"                              # inline code `...`
-    r"|(\*\*[^*]+\*\*)"                        # bold **...**
-    r"|(\*[^*]+\*)"                            # italic *...*
+    r"(?<!\$)\$(?!\$)(?P<math>.+?)(?<!\$)\$(?!\$)"  # inline math $...$
+    r"|(?P<code>`[^`]+`)"                                 # inline code `...`
+    r"|(?P<link>\[[^\]]+\]\([^)]+\))"                 # markdown link [text](url)
+    r"|(?P<autolink><https?://[^>\s]+>)"                  # autolink <https://...>
+    r"|(?P<bolditalic>\*\*\*[^*]+\*\*\*)"            # bold+italic ***...***
+    r"|(?P<bold>\*\*[^*]+\*\*)"                        # bold **...**
+    r"|(?P<strike>~~[^~]+~~)"                              # strikethrough ~~...~~
+    r"|(?P<italic>\*[^*]+\*)"                            # italic *...*
 )
 _IMAGE_PATTERN = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".tif", ".tiff", ".bmp", ".ico", ".heic"}
@@ -472,19 +476,21 @@ class NotionTool(Tool):
         in_code = False
         code_lang = "plain text"
         code_lines: list[str] = []
+        code_fence = "```"
 
         i = 0
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
 
-            code_start = re.match(r"^```\s*([A-Za-z0-9_+\-#.]*)\s*$", stripped)
+            code_start = re.match(r"^(```|~~~)\s*([A-Za-z0-9_+\-#.]*?)\s*$", stripped)
             if in_code:
-                if stripped.startswith("```"):
+                if stripped.startswith(code_fence):
                     blocks.extend(self._code_blocks_from_text("\n".join(code_lines), code_lang))
                     in_code = False
                     code_lang = "plain text"
                     code_lines = []
+                    code_fence = "```"
                 else:
                     code_lines.append(line)
                 i += 1
@@ -493,7 +499,8 @@ class NotionTool(Tool):
             if code_start:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
                 in_code = True
-                code_lang = code_start.group(1) or "plain text"
+                code_fence = code_start.group(1)
+                code_lang = code_start.group(2) or "plain text"
                 code_lines = []
                 i += 1
                 continue
@@ -551,6 +558,7 @@ class NotionTool(Tool):
                 i += 1
                 continue
 
+            # Table block (requires Markdown alignment row to reduce false positives)
             if self._is_table_line(stripped):
                 maybe_table_lines = [line]
                 j = i + 1
@@ -564,7 +572,7 @@ class NotionTool(Tool):
                     i = j
                     continue
 
-            heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+            heading = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
             if heading:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
                 level = len(heading.group(1))
@@ -588,6 +596,14 @@ class NotionTool(Tool):
                 i += 1
                 continue
 
+            todo = re.match(r"^\s*[-*]\s+\[( |x|X)\]\s+(.+)$", line)
+            if todo:
+                self._flush_paragraph_buffer(paragraph_buffer, blocks)
+                checked = todo.group(1).lower() == "x"
+                blocks.append(self._to_do_block(todo.group(2).strip(), checked=checked))
+                i += 1
+                continue
+
             bullet = re.match(r"^\s*[-*]\s+(.+)$", line)
             if bullet:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
@@ -595,7 +611,7 @@ class NotionTool(Tool):
                 i += 1
                 continue
 
-            numbered = re.match(r"^\s*\d+\.\s+(.+)$", line)
+            numbered = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
             if numbered:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
                 blocks.extend(self._text_blocks("numbered_list_item", numbered.group(1).strip()))
@@ -635,6 +651,19 @@ class NotionTool(Tool):
             "type": block_type,
             block_type: {"rich_text": rich_text},
         }]
+
+    def _to_do_block(self, text: str, checked: bool = False) -> dict[str, Any]:
+        rich_text = self._inline_to_rich_text(text)
+        if not rich_text:
+            rich_text = self._inline_to_rich_text(" ")
+        return {
+            "object": "block",
+            "type": "to_do",
+            "to_do": {
+                "rich_text": rich_text,
+                "checked": checked,
+            },
+        }
 
     def _bold_paragraph(self, text: str) -> list[dict[str, Any]]:
         """Render H5/H6 headings as bold paragraphs (Notion has no heading_4+)."""
@@ -681,43 +710,70 @@ class NotionTool(Tool):
             if start > cursor:
                 self._append_text_segment(rich_text, text[cursor:start], {})
 
-            token = match.group(0)
-            # Inline math: $...$
-            if match.group(1) is not None:
-                expression = match.group(1).strip()
+            if match.group("math") is not None:
+                expression = match.group("math").strip()
                 if expression:
                     rich_text.append({
                         "type": "equation",
                         "equation": {"expression": expression},
-                        "annotations": {
-                            "bold": False,
-                            "italic": False,
-                            "strikethrough": False,
-                            "underline": False,
-                            "code": False,
-                            "color": "default",
-                        },
-                        "plain_text": expression,
+                        "annotations": self._default_annotations(),
                     })
-            elif token.startswith("`") and token.endswith("`") and len(token) >= 2:
+            elif match.group("code") is not None:
+                token = match.group("code")
                 self._append_text_segment(rich_text, token[1:-1], {"code": True})
-            elif token.startswith("**") and token.endswith("**") and len(token) >= 4:
+            elif match.group("link") is not None:
+                label, url = self._parse_markdown_link(match.group("link"))
+                if url:
+                    self._append_text_segment(rich_text, label or url, {}, link_url=url)
+                else:
+                    self._append_text_segment(rich_text, match.group("link"), {})
+            elif match.group("autolink") is not None:
+                url = match.group("autolink")[1:-1].strip()
+                if url:
+                    self._append_text_segment(rich_text, url, {}, link_url=url)
+            elif match.group("bolditalic") is not None:
+                token = match.group("bolditalic")
+                self._append_text_segment(rich_text, token[3:-3], {"bold": True, "italic": True})
+            elif match.group("bold") is not None:
+                token = match.group("bold")
                 self._append_text_segment(rich_text, token[2:-2], {"bold": True})
-            elif token.startswith("*") and token.endswith("*") and len(token) >= 2:
+            elif match.group("strike") is not None:
+                token = match.group("strike")
+                self._append_text_segment(rich_text, token[2:-2], {"strikethrough": True})
+            elif match.group("italic") is not None:
+                token = match.group("italic")
                 self._append_text_segment(rich_text, token[1:-1], {"italic": True})
             else:
-                self._append_text_segment(rich_text, token, {})
+                self._append_text_segment(rich_text, match.group(0), {})
             cursor = end
 
         if cursor < len(text):
             self._append_text_segment(rich_text, text[cursor:], {})
         return rich_text
 
+    def _default_annotations(self, annotations: dict[str, Any] | None = None) -> dict[str, Any]:
+        merged = {
+            "bold": False,
+            "italic": False,
+            "strikethrough": False,
+            "underline": False,
+            "code": False,
+            "color": "default",
+        }
+        if annotations:
+            for key, value in annotations.items():
+                if key == "color":
+                    merged[key] = str(value) if value else "default"
+                elif key in merged:
+                    merged[key] = bool(value)
+        return merged
+
     def _append_text_segment(
         self,
         rich_text: list[dict[str, Any]],
         content: str,
         annotations: dict[str, Any],
+        link_url: str | None = None,
     ) -> None:
         if not content:
             return
@@ -726,15 +782,10 @@ class NotionTool(Tool):
                 "type": "text",
                 "text": {"content": chunk},
             }
-            if annotations:
-                item["annotations"] = {
-                    "bold": bool(annotations.get("bold", False)),
-                    "italic": bool(annotations.get("italic", False)),
-                    "strikethrough": False,
-                    "underline": False,
-                    "code": bool(annotations.get("code", False)),
-                    "color": "default",
-                }
+            if link_url:
+                item["text"]["link"] = {"url": link_url}
+            if annotations or link_url:
+                item["annotations"] = self._default_annotations(annotations)
             rich_text.append(item)
 
     def _build_table_block(self, lines: list[str]) -> dict[str, Any] | None:
@@ -743,20 +794,20 @@ class NotionTool(Tool):
             row = raw.strip()
             if not row:
                 continue
-            if row.startswith("|"):
-                row = row[1:]
-            if row.endswith("|"):
-                row = row[:-1]
-            cells = [cell.strip() for cell in row.split("|")]
+            cells = self._split_table_cells(row)
+            if len(cells) < 2:
+                return None
             rows.append(cells)
 
+        # Require at least header + alignment row for Markdown table.
+        # This avoids false positives for normal paragraphs containing '|'.
         if len(rows) < 2:
             return None
+        if not self._is_alignment_row(rows[1]):
+            return None
 
-        has_column_header = False
-        if len(rows) >= 2 and self._is_alignment_row(rows[1]):
-            has_column_header = True
-            rows.pop(1)
+        has_column_header = True
+        rows.pop(1)  # remove alignment row
 
         if not rows:
             return None
@@ -790,7 +841,85 @@ class NotionTool(Tool):
         return all(bool(re.match(r"^:?-{3,}:?$", c.strip())) for c in cells)
 
     def _is_table_line(self, line: str) -> bool:
-        return "|" in line and line.count("|") >= 2
+        if "|" not in line:
+            return False
+        cells = self._split_table_cells(line)
+        return len(cells) >= 2
+
+    def _split_table_cells(self, line: str) -> list[str]:
+        row = line.strip()
+        if row.startswith("|"):
+            row = row[1:]
+        if row.endswith("|"):
+            row = row[:-1]
+
+        cells: list[str] = []
+        buf: list[str] = []
+
+        in_code = False
+        in_math = False
+        depth_round = 0
+        depth_square = 0
+        depth_curly = 0
+
+        i = 0
+        while i < len(row):
+            ch = row[i]
+
+            if ch == "\\" and i + 1 < len(row):
+                # Preserve escaped literal, e.g., '\\|' should remain '|'
+                buf.append(row[i + 1])
+                i += 2
+                continue
+
+            if ch == "`":
+                in_code = not in_code
+                buf.append(ch)
+                i += 1
+                continue
+
+            if not in_code and ch == "$":
+                in_math = not in_math
+                buf.append(ch)
+                i += 1
+                continue
+
+            if not in_code and not in_math:
+                if ch == "(":
+                    depth_round += 1
+                elif ch == ")" and depth_round > 0:
+                    depth_round -= 1
+                elif ch == "[":
+                    depth_square += 1
+                elif ch == "]" and depth_square > 0:
+                    depth_square -= 1
+                elif ch == "{":
+                    depth_curly += 1
+                elif ch == "}" and depth_curly > 0:
+                    depth_curly -= 1
+
+                if ch == "|" and depth_round == 0 and depth_square == 0 and depth_curly == 0:
+                    cells.append("".join(buf).strip())
+                    buf = []
+                    i += 1
+                    continue
+
+            buf.append(ch)
+            i += 1
+
+        cells.append("".join(buf).strip())
+        return cells
+
+    def _parse_markdown_link(self, token: str) -> tuple[str, str]:
+        match = re.match(r"^\[([^\]]+)\]\((.+)\)$", token)
+        if not match:
+            return token, ""
+
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        if url.startswith("<") and url.endswith(">"):
+            url = url[1:-1].strip()
+        return label, url
 
     def _split_chunks(self, text: str, max_chars: int) -> list[str]:
         if not text:
