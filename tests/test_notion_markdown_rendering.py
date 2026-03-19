@@ -58,6 +58,19 @@ def test_inline_markdown_link_mapped_to_notion_link() -> None:
     assert link_tokens[0]["text"]["link"]["url"] == "https://example.com"
 
 
+def test_inline_anchor_link_degrades_to_plain_text_for_notion() -> None:
+    tool = _make_tool()
+    rt = tool._inline_to_rich_text("Jump to [Section](#sec-1)")
+
+    # Should keep readable label but without invalid Notion URL link attachment.
+    section_tokens = [
+        x for x in rt
+        if x.get("type") == "text" and x.get("text", {}).get("content") == "Section"
+    ]
+    assert section_tokens
+    assert section_tokens[0].get("text", {}).get("link") is None
+
+
 def test_inline_strike_and_bolditalic_annotations() -> None:
     tool = _make_tool()
     rt = tool._inline_to_rich_text("~~bad~~ then ***great***")
@@ -79,3 +92,57 @@ def test_todo_list_maps_to_to_do_block() -> None:
     assert [b["type"] for b in blocks] == ["to_do", "to_do"]
     assert blocks[0]["to_do"]["checked"] is True
     assert blocks[1]["to_do"]["checked"] is False
+
+
+def test_code_fence_with_space_language_parsed_correctly() -> None:
+    tool = _make_tool()
+    md = (
+        "### 3.2 Planner Prompt\n\n"
+        "```plain text\n"
+        "You are the Planner.\n"
+        "```\n\n"
+        "---\n\n"
+        "### 3.3 Coder Prompt\n"
+    )
+
+    blocks = tool._markdown_to_blocks(md)
+
+    # Expect heading -> code -> divider -> heading
+    types = [b["type"] for b in blocks]
+    assert types == ["heading_3", "code", "divider", "heading_3"]
+
+    code_block = blocks[1]["code"]
+    assert code_block["language"] == "plain text"
+    code_text = "".join(rt.get("text", {}).get("content", "") for rt in code_block["rich_text"])
+    assert "You are the Planner." in code_text
+
+
+def test_code_fence_close_not_confused_by_trailing_content() -> None:
+    tool = _make_tool()
+    md = (
+        "```python title=demo.py\n"
+        "print('ok')\n"
+        "```\n"
+        "### heading after code\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+    types = [b["type"] for b in blocks]
+    assert types == ["code", "heading_3"]
+    assert blocks[0]["code"]["language"] == "python"
+
+
+def test_code_language_alias_text_maps_to_plain_text() -> None:
+    tool = _make_tool()
+    blocks = tool._markdown_to_blocks("```text\nhello\n```\n")
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "code"
+    assert blocks[0]["code"]["language"] == "plain text"
+
+
+def test_code_language_alias_objective_c_maps_to_objective_c_dash() -> None:
+    tool = _make_tool()
+    blocks = tool._markdown_to_blocks("```objective c\nint main(){}\n```\n")
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "code"
+    assert blocks[0]["code"]["language"] == "objective-c"
+

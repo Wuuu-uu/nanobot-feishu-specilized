@@ -8,6 +8,7 @@ import mimetypes
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -39,6 +40,46 @@ _INLINE_PATTERN = re.compile(
 )
 _IMAGE_PATTERN = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".tif", ".tiff", ".bmp", ".ico", ".heic"}
+
+# Notion code block languages (as accepted by Notion API)
+_NOTION_CODE_LANGUAGES = {
+    "abap", "abc", "agda", "arduino", "ascii art", "assembly", "bash", "basic", "bnf",
+    "c", "c#", "c++", "clojure", "coffeescript", "coq", "css", "dart", "dhall", "diff",
+    "docker", "ebnf", "elixir", "elm", "erlang", "f#", "flow", "fortran", "gherkin",
+    "glsl", "go", "graphql", "groovy", "haskell", "hcl", "html", "idris", "java",
+    "javascript", "json", "julia", "kotlin", "latex", "less", "lisp", "livescript",
+    "llvm ir", "lua", "makefile", "markdown", "markup", "matlab", "mathematica", "mermaid",
+    "nix", "notion formula", "objective-c", "ocaml", "pascal", "perl", "php", "plain text",
+    "powershell", "prolog", "protobuf", "purescript", "python", "r", "racket", "reason",
+    "ruby", "rust", "sass", "scala", "scheme", "scss", "shell", "smalltalk", "solidity",
+    "sql", "swift", "toml", "typescript", "vb.net", "verilog", "vhdl", "visual basic",
+    "webassembly", "xml", "yaml", "java/c/c++/c#",
+}
+
+_NOTION_CODE_LANGUAGE_ALIASES = {
+    "text": "plain text",
+    "plaintext": "plain text",
+    "plain": "plain text",
+    "txt": "plain text",
+    "console": "shell",
+    "shellscript": "shell",
+    "sh": "shell",
+    "zsh": "shell",
+    "bash script": "bash",
+    "js": "javascript",
+    "ts": "typescript",
+    "py": "python",
+    "yml": "yaml",
+    "md": "markdown",
+    "objc": "objective-c",
+    "objective c": "objective-c",
+    "objective_c": "objective-c",
+    "csharp": "c#",
+    "cs": "c#",
+    "cpp": "c++",
+    "cxx": "c++",
+    "golang": "go",
+}
 
 
 class NotionTool(Tool):
@@ -483,9 +524,9 @@ class NotionTool(Tool):
             line = lines[i]
             stripped = line.strip()
 
-            code_start = re.match(r"^(```|~~~)\s*([A-Za-z0-9_+\-#.]*?)\s*$", stripped)
+            code_start = self._parse_code_fence_open(stripped)
             if in_code:
-                if stripped.startswith(code_fence):
+                if self._is_code_fence_close(stripped, code_fence):
                     blocks.extend(self._code_blocks_from_text("\n".join(code_lines), code_lang))
                     in_code = False
                     code_lang = "plain text"
@@ -499,8 +540,8 @@ class NotionTool(Tool):
             if code_start:
                 self._flush_paragraph_buffer(paragraph_buffer, blocks)
                 in_code = True
-                code_fence = code_start.group(1)
-                code_lang = code_start.group(2) or "plain text"
+                code_fence, code_info = code_start
+                code_lang = self._normalize_code_language(code_info)
                 code_lines = []
                 i += 1
                 continue
@@ -690,13 +731,14 @@ class NotionTool(Tool):
     def _code_blocks_from_text(self, text: str, language: str = "plain text") -> list[dict[str, Any]]:
         if not text:
             return []
+        notion_language = self._to_notion_code_language(language)
         blocks: list[dict[str, Any]] = []
         for chunk in self._split_chunks(text, _MAX_RICH_TEXT_CHARS):
             blocks.append({
                 "object": "block",
                 "type": "code",
                 "code": {
-                    "language": language or "plain text",
+                    "language": notion_language,
                     "rich_text": [{"type": "text", "text": {"content": chunk}}],
                 },
             })
@@ -723,10 +765,12 @@ class NotionTool(Tool):
                 self._append_text_segment(rich_text, token[1:-1], {"code": True})
             elif match.group("link") is not None:
                 label, url = self._parse_markdown_link(match.group("link"))
-                if url:
+                if url and self._is_valid_notion_link_url(url):
                     self._append_text_segment(rich_text, label or url, {}, link_url=url)
                 else:
-                    self._append_text_segment(rich_text, match.group("link"), {})
+                    # Notion text links require valid URL. For in-page anchors or local paths,
+                    # gracefully degrade to plain text to avoid API validation errors.
+                    self._append_text_segment(rich_text, label or match.group("link"), {})
             elif match.group("autolink") is not None:
                 url = match.group("autolink")[1:-1].strip()
                 if url:
@@ -921,6 +965,12 @@ class NotionTool(Tool):
             url = url[1:-1].strip()
         return label, url
 
+    def _is_valid_notion_link_url(self, url: str) -> bool:
+        if not url:
+            return False
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
     def _split_chunks(self, text: str, max_chars: int) -> list[str]:
         if not text:
             return []
@@ -931,6 +981,85 @@ class NotionTool(Tool):
             chunks.append(text[start:end])
             start = end
         return chunks
+
+    def _parse_code_fence_open(self, stripped_line: str) -> tuple[str, str] | None:
+        """Parse Markdown code-fence opener.
+
+        Supports:
+        - ```
+        - ```python
+        - ```plain text
+        - ~~~ts
+        - ```python title="x.py"   (captures full info string)
+        """
+        if not stripped_line:
+            return None
+
+        match = re.match(r"^(`{3,}|~{3,})(.*)$", stripped_line)
+        if not match:
+            return None
+
+        fence = match.group(1)
+        info = match.group(2).strip()
+        return fence, info
+
+    def _is_code_fence_close(self, stripped_line: str, opening_fence: str) -> bool:
+        if not stripped_line or not opening_fence:
+            return False
+
+        # Closing fence must use same marker type and at least opening length.
+        marker = opening_fence[0]
+        if marker not in {"`", "~"}:
+            return False
+
+        required_len = len(opening_fence)
+        match = re.match(r"^([`~]+)\s*$", stripped_line)
+        if not match:
+            return False
+
+        run = match.group(1)
+        return run[0] == marker and len(run) >= required_len
+
+    def _normalize_code_language(self, info: str) -> str:
+        if not info:
+            return "plain text"
+
+        # Keep whole info-string if it does not look like key=value metadata.
+        # This preserves common names like "plain text" and "objective c".
+        lowered = info.strip().lower()
+        if not lowered:
+            return "plain text"
+
+        # If metadata style exists (e.g., "python title=..."), use first token as language.
+        if re.search(r"\b\w+\s*=", info):
+            lang = info.split()[0]
+            return lang or "plain text"
+
+        return info
+
+    def _to_notion_code_language(self, language: str | None) -> str:
+        """Normalize language token to Notion accepted enum, fallback to plain text."""
+        lang = (language or "").strip().lower()
+        if not lang:
+            return "plain text"
+
+        # Apply explicit aliases first.
+        lang = _NOTION_CODE_LANGUAGE_ALIASES.get(lang, lang)
+
+        # Normalize common separators for matching.
+        compact = re.sub(r"[\s_\-]+", " ", lang).strip()
+        compact = _NOTION_CODE_LANGUAGE_ALIASES.get(compact, compact)
+
+        if compact in _NOTION_CODE_LANGUAGES:
+            return compact
+
+        # Try exact no-space forms for aliases like "objectivec".
+        nospace = compact.replace(" ", "")
+        mapped = _NOTION_CODE_LANGUAGE_ALIASES.get(nospace)
+        if mapped and mapped in _NOTION_CODE_LANGUAGES:
+            return mapped
+
+        return "plain text"
 
     def _build_type_filter(self, schema: dict[str, Any], doc_type: str) -> dict[str, Any] | None:
         prop_name = self.config.type_property
