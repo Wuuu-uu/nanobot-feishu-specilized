@@ -31,13 +31,15 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.session_manage import SessionManageTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
-from nanobot.session.manager import SessionManager
+from nanobot.session.compressor import SessionContextCompressor
+from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
         ExecToolConfig,
         FeishuConfig,
         ImageGenConfig,
+        ContextCompressionConfig,
         MineruConfig,
         NotionToolConfig,
         ToolHistoryConfig,
@@ -72,6 +74,7 @@ class AgentLoop:
         image_gen_config: ImageGenConfig | None = None,
         notion_config: NotionToolConfig | None = None,
         tool_history_config: ToolHistoryConfig | None = None,
+        context_compression_config: ContextCompressionConfig | None = None,
         feishu_config: FeishuConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
@@ -79,6 +82,7 @@ class AgentLoop:
         from nanobot.config.schema import ExecToolConfig
         from nanobot.config.schema import FeishuConfig
         from nanobot.config.schema import ImageGenConfig
+        from nanobot.config.schema import ContextCompressionConfig
         from nanobot.config.schema import MineruConfig
         from nanobot.config.schema import NotionToolConfig
         from nanobot.config.schema import ToolHistoryConfig
@@ -96,12 +100,19 @@ class AgentLoop:
         self.image_gen_config = image_gen_config or ImageGenConfig()
         self.notion_config = notion_config or NotionToolConfig()
         self.tool_history_config = tool_history_config or ToolHistoryConfig()
+        self.context_compression_config = context_compression_config or ContextCompressionConfig()
         self.feishu_config = feishu_config or FeishuConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
+        self.compressor = SessionContextCompressor(
+            provider=provider,
+            sessions_dir=self.sessions.sessions_dir,
+            config=self.context_compression_config,
+            default_model=self.model,
+        )
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -122,7 +133,38 @@ class AgentLoop:
         self._tool_digest_max_events = max(1, self.tool_history_config.max_events)
         self._tool_digest_max_chars = max(200, self.tool_history_config.max_chars)
         self._tool_preview_chars = max(80, self.tool_history_config.preview_chars)
+        self._history_max_messages = 50
+        self._history_precompress_max_messages = self._history_max_messages
+        self._history_postcompress_max_messages = self._history_max_messages
+        self._history_no_gap_cap = self._history_max_messages
+        if self.context_compression_config.enabled:
+            self._history_precompress_max_messages = max(
+                self._history_max_messages,
+                self.context_compression_config.trigger_by_message_count,
+            )
+            self._history_postcompress_max_messages = max(
+                10,
+                self.context_compression_config.keep_recent_messages + 5,
+            )
+            self._history_no_gap_cap = max(
+                self._history_precompress_max_messages,
+                self.context_compression_config.trigger_by_message_count,
+            )
         self._register_default_tools()
+
+    def _resolve_history_limit(self, session: Session, session_summary: str) -> int:
+        """Resolve history size while preventing any summary-to-window gaps."""
+        if not self.context_compression_config.enabled:
+            return self._history_precompress_max_messages
+
+        active_count = sum(1 for m in session.messages if m.get("include_in_context", True))
+        active_floor = max(1, min(active_count, self._history_no_gap_cap))
+
+        # With summary enabled, always include all active (not-yet-compressed) messages
+        # up to next compression cap to avoid memory gaps between summary and recent window.
+        if session_summary:
+            return max(self._history_postcompress_max_messages, active_floor)
+        return max(self._history_precompress_max_messages, active_floor)
 
 
     
@@ -250,6 +292,9 @@ class AgentLoop:
         active_key = self.sessions.get_active_session_key(msg.channel, msg.chat_id)
         session_key = active_key or msg.session_key
         session = self.sessions.get_or_create(session_key)
+        await self.compressor.compress_if_needed(session)
+        session_summary = self.compressor.get_summary(session.key)
+        history_limit = self._resolve_history_limit(session, session_summary)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -275,11 +320,13 @@ class AgentLoop:
         # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
             history=session.get_history(
+                max_messages=history_limit,
                 tool_max_events=self._tool_digest_max_events,
                 tool_preview_chars=self._tool_preview_chars,
                 tool_max_chars=self._tool_digest_max_chars,
             ),
             current_message=msg.content,
+            session_summary=session_summary,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -357,6 +404,7 @@ class AgentLoop:
         
         # Save to session
         session.add_message("assistant", final_content)
+        await self.compressor.compress_if_needed(session)
         self.sessions.save(session)
         
         return OutboundMessage(
@@ -388,6 +436,9 @@ class AgentLoop:
         active_key = self.sessions.get_active_session_key(origin_channel, origin_chat_id)
         session_key = active_key or f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
+        await self.compressor.compress_if_needed(session)
+        session_summary = self.compressor.get_summary(session.key)
+        history_limit = self._resolve_history_limit(session, session_summary)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -413,11 +464,13 @@ class AgentLoop:
         # Build messages with the announce content
         messages = self.context.build_messages(
             history=session.get_history(
+                max_messages=history_limit,
                 tool_max_events=self._tool_digest_max_events,
                 tool_preview_chars=self._tool_preview_chars,
                 tool_max_chars=self._tool_digest_max_chars,
             ),
             current_message=msg.content,
+            session_summary=session_summary,
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
@@ -478,6 +531,7 @@ class AgentLoop:
         
         # Save to session (mark as system message in history)
         session.add_message("assistant", final_content)
+        await self.compressor.compress_if_needed(session)
         self.sessions.save(session)
         
         return OutboundMessage(

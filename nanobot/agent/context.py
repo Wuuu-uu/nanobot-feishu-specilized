@@ -25,7 +25,11 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        session_summary: str | None = None,
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
@@ -49,6 +53,9 @@ class ContextBuilder:
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
+
+        if session_summary:
+            parts.append(f"# Session Rolling Summary\n\n{session_summary}")
         
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
@@ -123,6 +130,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         history: list[dict[str, Any]],
         current_message: str,
         skill_names: list[str] | None = None,
+        session_summary: str | None = None,
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
@@ -144,7 +152,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(
+            skill_names,
+            session_summary=session_summary,
+        )
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})

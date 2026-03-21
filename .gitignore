@@ -18,3 +18,5 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 workspace/history
+scripts
+output_llms

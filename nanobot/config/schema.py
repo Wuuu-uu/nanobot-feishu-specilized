@@ -175,6 +175,18 @@ class ToolHistoryConfig(BaseModel):
     max_chars: int = 800
 
 
+class ContextCompressionConfig(BaseModel):
+    """Conversation context compression configuration."""
+    enabled: bool = False
+    trigger_by_message_count: int = 80
+    trigger_by_estimated_tokens: int = 12000
+    keep_recent_messages: int = 25
+    summary_max_tokens: int = 800
+    max_rolling_summary_tokens: int = 2000
+    summary_model: str | None = None
+    min_interval_seconds: int = 60
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
@@ -183,6 +195,7 @@ class ToolsConfig(BaseModel):
     image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
     notion: NotionToolConfig = Field(default_factory=NotionToolConfig)
     tool_history: ToolHistoryConfig = Field(default_factory=ToolHistoryConfig)
+    context_compression: ContextCompressionConfig = Field(default_factory=ContextCompressionConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 

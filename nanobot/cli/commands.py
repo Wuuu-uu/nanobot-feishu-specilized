@@ -213,6 +213,7 @@ def gateway(
         image_gen_config=config.tools.image_gen,
         notion_config=config.tools.notion,
         tool_history_config=config.tools.tool_history,
+        context_compression_config=config.tools.context_compression,
         feishu_config=config.channels.feishu,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -329,6 +330,7 @@ def agent(
         mineru_config=config.tools.mineru,
         notion_config=config.tools.notion,
         tool_history_config=config.tools.tool_history,
+        context_compression_config=config.tools.context_compression,
         feishu_config=config.channels.feishu,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )
