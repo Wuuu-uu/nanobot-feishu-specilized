@@ -273,3 +273,70 @@ def test_flat_list_unchanged() -> None:
     for b in blocks:
         assert b["type"] == "bulleted_list_item"
         assert "children" not in b["bulleted_list_item"]
+
+
+# ---------------------------------------------------------------------------
+# Table cell: LaTeX backslash preservation
+# ---------------------------------------------------------------------------
+
+def test_table_cell_latex_backslash_preserved():
+    """\\frac, \\sum, \\mathcal etc. inside table cells must NOT lose backslashes."""
+    tool = _make_tool()
+    md = (
+        "| Name | Formula |\n"
+        "| --- | --- |\n"
+        "| Loss | $\\mathcal{L} = \\frac{1}{n}\\sum_{i=1}^{n}(y_i - \\hat{y}_i)^2$ |\n"
+        "| Attention | $\\text{softmax}\\left(\\frac{QK^T}{\\sqrt{d_k}}\\right)V$ |\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+    # Should produce a table block
+    assert blocks[0]["type"] == "table"
+    rows = blocks[0]["table"]["children"]
+    # Row 0: header, Row 1: Loss, Row 2: Attention
+    loss_cell = rows[1]["table_row"]["cells"][1]  # second cell of Loss row
+    attn_cell = rows[2]["table_row"]["cells"][1]  # second cell of Attention row
+
+    # Collect plain text and equation content from rich text segments
+    def get_text_and_eq(cell):
+        parts = []
+        for seg in cell:
+            if seg["type"] == "text":
+                parts.append(("text", seg["text"]["content"]))
+            elif seg["type"] == "equation":
+                parts.append(("eq", seg["equation"]["expression"]))
+        return parts
+
+    loss_parts = get_text_and_eq(loss_cell)
+    attn_parts = get_text_and_eq(attn_cell)
+
+    # There should be exactly one equation segment per cell
+    loss_eqs = [v for t, v in loss_parts if t == "eq"]
+    attn_eqs = [v for t, v in attn_parts if t == "eq"]
+    assert len(loss_eqs) == 1, f"Expected 1 equation in loss cell, got: {loss_parts}"
+    assert len(attn_eqs) == 1, f"Expected 1 equation in attn cell, got: {attn_parts}"
+
+    # Backslashes must be intact
+    assert "\\mathcal" in loss_eqs[0], f"\\\\mathcal missing: {loss_eqs[0]}"
+    assert "\\frac" in loss_eqs[0], f"\\\\frac missing: {loss_eqs[0]}"
+    assert "\\sum" in loss_eqs[0], f"\\\\sum missing: {loss_eqs[0]}"
+    assert "\\frac" in attn_eqs[0], f"\\\\frac missing in attn: {attn_eqs[0]}"
+    assert "\\sqrt" in attn_eqs[0], f"\\\\sqrt missing in attn: {attn_eqs[0]}"
+
+
+def test_table_cell_escaped_pipe_still_works():
+    """A literal \\| inside a cell should be kept as '|' (not split the cell)."""
+    tool = _make_tool()
+    md = (
+        "| Col A | Col B |\n"
+        "| --- | --- |\n"
+        r"| foo\|bar | baz |" + "\n"
+    )
+    blocks = tool._markdown_to_blocks(md)
+    rows = blocks[0]["table"]["children"]
+    # 'foo|bar' should be in a single cell, not split
+    cell_a = rows[1]["table_row"]["cells"][0]
+    text = "".join(
+        seg["text"]["content"] for seg in cell_a if seg["type"] == "text"
+    )
+    assert "|" in text, f"Escaped pipe should remain as '|': got {text}"
+    assert "foo" in text and "bar" in text, f"Cell content wrong: {text}"

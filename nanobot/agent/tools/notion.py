@@ -1018,9 +1018,15 @@ class NotionTool(Tool):
             ch = row[i]
 
             if ch == "\\" and i + 1 < len(row):
-                # Preserve escaped literal, e.g., '\\|' should remain '|'
-                buf.append(row[i + 1])
-                i += 2
+                next_ch = row[i + 1]
+                if next_ch == "|":
+                    # Only consume backslash for escaped pipe '\|' → '|'
+                    buf.append("|")
+                    i += 2
+                else:
+                    # Preserve backslash as-is (critical for LaTeX: \frac, \sum, \mathcal, etc.)
+                    buf.append(ch)
+                    i += 1
                 continue
 
             if ch == "`":
