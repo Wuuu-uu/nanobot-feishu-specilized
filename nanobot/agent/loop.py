@@ -208,10 +208,6 @@ class AgentLoop:
         cache_tokens = cls._safe_int(usage.get("cache_tokens"))
         total_tokens = cls._safe_int(usage.get("total_tokens"))
 
-        input_cached_tokens = min(input_tokens, cache_tokens)
-        input_uncached_tokens = max(0, input_tokens - input_cached_tokens)
-        sum_tokens = input_tokens + output_tokens
-
         output_budget = max(1, cls._safe_int(output_budget_tokens))
         output_used = output_tokens
         output_raw_residue = output_budget - output_used
@@ -233,8 +229,6 @@ class AgentLoop:
 
         return {
             "input_tokens": input_tokens,
-            "input_cached_tokens": input_cached_tokens,
-            "input_uncached_tokens": input_uncached_tokens,
             "output_tokens": output_tokens,
             "cache_tokens": cache_tokens,
             "task_total_tokens": total_tokens,
@@ -265,23 +259,13 @@ class AgentLoop:
                     "values": [
                         {
                             "category": "token用量",
-                            "item": "input_cached",
-                            "value": input_cached_tokens,
-                        },
-                        {
-                            "category": "token用量",
-                            "item": "input_uncached",
-                            "value": input_uncached_tokens,
+                            "item": "input",
+                            "value": input_tokens,
                         },
                         {
                             "category": "token用量",
                             "item": "output",
                             "value": output_tokens,
-                        },
-                        {
-                            "category": "token用量",
-                            "item": "sum_tokens",
-                            "value": sum_tokens,
                         },
                     ]
                 },
@@ -569,12 +553,89 @@ class AgentLoop:
             self.context_window_tokens,
             self.token_budget_mode,
         )
+
+        if self._should_publish_feishu_streaming(msg, final_content):
+            await self._publish_feishu_streaming_response(msg, final_content, token_monitor)
+            return None
         
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
             metadata={"token_monitor": token_monitor},
+        )
+
+    def _should_publish_feishu_streaming(self, msg: InboundMessage, final_content: str) -> bool:
+        """Use phase-1 pseudo streaming for Feishu outbound delivery."""
+        return (
+            msg.channel == "feishu"
+            and self.feishu_config.streaming_enabled
+            and bool(final_content)
+        )
+
+    async def _publish_feishu_streaming_response(
+        self,
+        msg: InboundMessage,
+        final_content: str,
+        token_monitor: dict[str, Any],
+    ) -> None:
+        """Publish init/append/finalize events consumed by FeishuChannel streaming state machine."""
+        stream_id = f"{msg.channel}:{msg.chat_id}:{int(time.time() * 1000)}"
+        chunk_chars = max(20, int(self.feishu_config.streaming_print_step_default) * 16)
+        interval = max(0.08, float(self.feishu_config.streaming_print_frequency_ms_default) / 1000.0 * 4.0)
+
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="",
+                metadata={
+                    "token_monitor": token_monitor,
+                    "feishu_stream": {
+                        "action": "init",
+                        "stream_id": stream_id,
+                        "full_text": "",
+                    },
+                },
+            )
+        )
+
+        total = len(final_content)
+        cursor = 0
+        while cursor < total:
+            cursor = min(total, cursor + chunk_chars)
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=final_content[:cursor],
+                    metadata={
+                        "token_monitor": token_monitor,
+                        "feishu_stream": {
+                            "action": "append",
+                            "stream_id": stream_id,
+                            "full_text": final_content[:cursor],
+                        },
+                    },
+                )
+            )
+            if cursor < total:
+                await asyncio.sleep(interval)
+
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+                metadata={
+                    "token_monitor": token_monitor,
+                    "feishu_stream": {
+                        "action": "finalize",
+                        "stream_id": stream_id,
+                        "full_text": final_content,
+                    },
+                },
+            )
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:

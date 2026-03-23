@@ -14,8 +14,7 @@ def test_build_token_monitor_clamps_negative_residue() -> None:
         token_budget_mode="output",
     )
 
-    assert monitor["input_cached_tokens"] == 12
-    assert monitor["input_uncached_tokens"] == 78
+    assert monitor["input_tokens"] == 90
     assert monitor["output_budget_total_tokens"] == 30
     assert monitor["output_budget_used_tokens"] == 40
     assert monitor["output_budget_residue_tokens"] == 0
@@ -38,7 +37,5 @@ def test_build_token_monitor_chart_values_match_usage() -> None:
     )
 
     values = monitor["chart"]["data"]["values"]
-    assert values[0] == {"category": "token用量", "item": "input_cached", "value": 5}
-    assert values[1] == {"category": "token用量", "item": "input_uncached", "value": 45}
-    assert values[2] == {"category": "token用量", "item": "output", "value": 30}
-    assert values[3] == {"category": "token用量", "item": "sum_tokens", "value": 80}
+    assert values[0] == {"category": "token用量", "item": "input", "value": 50}
+    assert values[1] == {"category": "token用量", "item": "output", "value": 30}

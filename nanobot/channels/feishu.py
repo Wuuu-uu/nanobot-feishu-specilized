@@ -6,7 +6,9 @@ import mimetypes
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -48,6 +50,19 @@ MSG_TYPE_MAP = {
 }
 
 
+@dataclass
+class _FeishuStreamState:
+    """Runtime state for one streaming card session."""
+
+    card_id: str
+    message_id: str
+    element_id: str
+    sequence: int = 1
+    flushed_text: str = ""
+    pending_text: str = ""
+    last_flush_ts: float = 0.0
+
+
 class FeishuChannel(BaseChannel):
     """
     Feishu/Lark channel using WebSocket long connection.
@@ -73,6 +88,10 @@ class FeishuChannel(BaseChannel):
         self._tenant_access_token: str | None = None
         self._tenant_access_token_expire_at: float = 0.0
         self._media_dir = get_media_path(self.config.media_dir)
+        self._stream_states: dict[str, _FeishuStreamState] = {}
+        self._stream_locks: dict[str, asyncio.Lock] = {}
+        self._stream_degraded: set[str] = set()
+        self._stream_fallback_sent: set[str] = set()
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -176,12 +195,9 @@ class FeishuChannel(BaseChannel):
             return
         
         try:
-            # Determine receive_id_type based on chat_id format
-            # open_id starts with "ou_", chat_id starts with "oc_"
-            if msg.chat_id.startswith("oc_"):
-                receive_id_type = "chat_id"
-            else:
-                receive_id_type = "open_id"
+            receive_id_type = self._resolve_receive_id_type(msg.chat_id)
+            metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+            stream_payload = metadata.get("feishu_stream") if isinstance(metadata.get("feishu_stream"), dict) else None
             
             # Prepare outbound message payload and media uploads
             image_keys: list[str] = []
@@ -198,42 +214,23 @@ class FeishuChannel(BaseChannel):
                     except Exception as e:
                         logger.warning(f"Failed to upload media {media_path}: {e}")
 
-            if msg.content:
-                template_id = self.config.card_template_id
-                template_version_name = self.config.card_template_version_name
-                if isinstance(msg.metadata, dict):
-                    template_id = msg.metadata.get("template_id", template_id)
-                    template_version_name = msg.metadata.get("template_version_name", template_version_name)
-
-                # Replace local markdown image paths with uploaded Feishu image keys.
-                card_text = await self._replace_local_md_images_with_keys(msg.content)
-
-                content = self._build_interactive_content(
-                    card_text,
-                    template_id=template_id,
-                    template_version_name=template_version_name,
-                    token_monitor=msg.metadata.get("token_monitor") if isinstance(msg.metadata, dict) else None,
-                )
-
-                request = CreateMessageRequest.builder() \
-                    .receive_id_type(receive_id_type) \
-                    .request_body(
-                        CreateMessageRequestBody.builder()
-                        .receive_id(msg.chat_id)
-                        .msg_type("interactive")
-                        .content(content)
-                        .build()
-                    ).build()
-
-                response = self._client.im.v1.message.create(request)
-
-                if not response.success():
-                    logger.error(
-                        f"Failed to send Feishu message: code={response.code}, "
-                        f"msg={response.msg}, log_id={response.get_log_id()}"
+            if msg.content or (self.config.streaming_enabled and stream_payload):
+                if self.config.streaming_enabled and stream_payload:
+                    stream_id = str(stream_payload.get("stream_id") or f"{msg.chat_id}:default")
+                    handled = await self._handle_streaming_message(
+                        msg=msg,
+                        receive_id_type=receive_id_type,
+                        stream_payload=stream_payload,
                     )
+                    if (
+                        not handled
+                        and msg.content
+                        and stream_id not in self._stream_fallback_sent
+                    ):
+                        self._stream_fallback_sent.add(stream_id)
+                        await self._send_template_message(msg, receive_id_type)
                 else:
-                    logger.debug(f"Feishu message sent to {msg.chat_id}")
+                    await self._send_template_message(msg, receive_id_type)
 
             for image_key in image_keys:
                 await self._send_image_message(image_key, msg.chat_id, receive_id_type)
@@ -243,6 +240,207 @@ class FeishuChannel(BaseChannel):
                 
         except Exception as e:
             logger.error(f"Error sending Feishu message: {e}")
+
+    def _resolve_receive_id_type(self, chat_id: str) -> str:
+        """Infer receive_id_type from Feishu identifier prefix."""
+        return "chat_id" if chat_id.startswith("oc_") else "open_id"
+
+    async def _send_template_message(self, msg: OutboundMessage, receive_id_type: str) -> None:
+        """Send one-shot interactive template card (existing behavior)."""
+        template_id = self.config.card_template_id
+        template_version_name = self.config.card_template_version_name
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        template_id = metadata.get("template_id", template_id)
+        template_version_name = metadata.get("template_version_name", template_version_name)
+
+        card_text = await self._replace_local_md_images_with_keys(msg.content)
+        content = self._build_interactive_content(
+            card_text,
+            template_id=template_id,
+            template_version_name=template_version_name,
+            token_monitor=metadata.get("token_monitor"),
+        )
+
+        request = CreateMessageRequest.builder() \
+            .receive_id_type(receive_id_type) \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(msg.chat_id)
+                .msg_type("interactive")
+                .content(content)
+                .build()
+            ).build()
+
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            logger.error(
+                f"Failed to send Feishu message: code={response.code}, "
+                f"msg={response.msg}, log_id={response.get_log_id()}"
+            )
+            return
+        logger.debug(f"Feishu template message sent to {msg.chat_id}")
+
+    async def _handle_streaming_message(
+        self,
+        msg: OutboundMessage,
+        receive_id_type: str,
+        stream_payload: dict[str, Any],
+    ) -> bool:
+        """Handle Feishu CardKit streaming init/append/finalize lifecycle."""
+        action = str(stream_payload.get("action", "")).strip().lower()
+        if action not in {"init", "append", "finalize"}:
+            logger.warning(f"Unknown feishu_stream action: {action}")
+            return False
+
+        stream_id = str(stream_payload.get("stream_id") or f"{msg.chat_id}:default")
+        if stream_id in self._stream_degraded:
+            if action == "finalize":
+                self._cleanup_stream_state(stream_id)
+            return True
+
+        lock = self._stream_locks.setdefault(stream_id, asyncio.Lock())
+        async with lock:
+            try:
+                if action == "init":
+                    await self._stream_init(msg, receive_id_type, stream_id, stream_payload)
+                    return True
+
+                state = self._stream_states.get(stream_id)
+                if state is None:
+                    logger.warning(f"Missing stream state for {stream_id}, auto-initializing")
+                    await self._stream_init(msg, receive_id_type, stream_id, stream_payload)
+                    state = self._stream_states.get(stream_id)
+                    if state is None:
+                        return False
+
+                if action == "append":
+                    await self._stream_append(msg, stream_payload, state)
+                    return True
+
+                await self._stream_finalize(msg, stream_payload, stream_id, state)
+                return True
+            except Exception as e:
+                logger.error(f"Feishu streaming action failed ({action}, {stream_id}): {e}")
+                self._stream_degraded.add(stream_id)
+                return False
+
+    def _cleanup_stream_state(self, stream_id: str) -> None:
+        """Release in-memory state for one stream lifecycle."""
+        self._stream_states.pop(stream_id, None)
+        self._stream_locks.pop(stream_id, None)
+        self._stream_degraded.discard(stream_id)
+        self._stream_fallback_sent.discard(stream_id)
+
+    async def _stream_init(
+        self,
+        msg: OutboundMessage,
+        receive_id_type: str,
+        stream_id: str,
+        stream_payload: dict[str, Any],
+    ) -> None:
+        """Create streaming card and send it once using card_id payload."""
+        initial_text = stream_payload.get("full_text")
+        if not isinstance(initial_text, str):
+            initial_text = msg.content or ""
+        if not initial_text.strip():
+            initial_text = "Generating..."
+
+        initial_text = await self._replace_local_md_images_with_keys(initial_text)
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        token_monitor = metadata.get("token_monitor") if isinstance(metadata.get("token_monitor"), dict) else None
+
+        card_json = self._build_streaming_card_json(initial_text, token_monitor=token_monitor)
+        try:
+            card_id = await self._cardkit_create_card(card_json)
+        except Exception:
+            # Keep streaming available even if chart schema is rejected by server/client constraints.
+            logger.warning("CardKit create with token chart failed, retrying without chart")
+            card_json = self._build_streaming_card_json(initial_text, token_monitor=None)
+            card_id = await self._cardkit_create_card(card_json)
+        message_id = await self._cardkit_send_card_message(
+            receive_id=msg.chat_id,
+            receive_id_type=receive_id_type,
+            card_id=card_id,
+        )
+        self._stream_states[stream_id] = _FeishuStreamState(
+            card_id=card_id,
+            message_id=message_id,
+            element_id="answer_markdown",
+            sequence=1,
+            flushed_text=initial_text,
+            pending_text=initial_text,
+            last_flush_ts=time.monotonic(),
+        )
+        logger.debug(f"Feishu streaming initialized: stream_id={stream_id}, card_id={card_id}")
+
+    async def _stream_append(
+        self,
+        msg: OutboundMessage,
+        stream_payload: dict[str, Any],
+        state: _FeishuStreamState,
+    ) -> None:
+        """Push full text update to CardKit stream API with local throttling."""
+        full_text = stream_payload.get("full_text")
+        if not isinstance(full_text, str):
+            full_text = msg.content or ""
+
+        full_text = await self._replace_local_md_images_with_keys(full_text)
+        if not full_text:
+            return
+
+        state.pending_text = full_text
+        force_flush = bool(stream_payload.get("force", False))
+        max_updates = max(1, int(self.config.streaming_max_updates_per_sec))
+        min_interval = 1.0 / max_updates
+        now = time.monotonic()
+        if not force_flush and (now - state.last_flush_ts) < min_interval:
+            return
+
+        if state.pending_text == state.flushed_text:
+            return
+
+        await self._cardkit_stream_text(
+            card_id=state.card_id,
+            element_id=state.element_id,
+            full_text=state.pending_text,
+            sequence=state.sequence,
+        )
+        state.sequence += 1
+        state.flushed_text = state.pending_text
+        state.last_flush_ts = time.monotonic()
+
+    async def _stream_finalize(
+        self,
+        msg: OutboundMessage,
+        stream_payload: dict[str, Any],
+        stream_id: str,
+        state: _FeishuStreamState,
+    ) -> None:
+        """Flush latest text then close streaming mode."""
+        final_text = stream_payload.get("full_text")
+        if not isinstance(final_text, str):
+            final_text = msg.content or state.pending_text or state.flushed_text
+
+        if final_text:
+            state.pending_text = await self._replace_local_md_images_with_keys(final_text)
+
+        if state.pending_text and state.pending_text != state.flushed_text:
+            await self._cardkit_stream_text(
+                card_id=state.card_id,
+                element_id=state.element_id,
+                full_text=state.pending_text,
+                sequence=state.sequence,
+            )
+            state.sequence += 1
+            state.flushed_text = state.pending_text
+
+        await self._cardkit_update_settings(
+            card_id=state.card_id,
+            settings={"config": {"streaming_mode": False}},
+            sequence=state.sequence,
+        )
+        self._cleanup_stream_state(stream_id)
+        logger.debug(f"Feishu streaming finalized: stream_id={stream_id}, card_id={state.card_id}")
 
     def _upload_image(self, image_path: str) -> str:
         if not self._client or not FEISHU_AVAILABLE:
@@ -471,6 +669,187 @@ class FeishuChannel(BaseChannel):
             },
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _default_token_chart() -> dict[str, Any]:
+        return {
+            "type": "bar",
+            "direction": "horizontal",
+            "title": {"text": "token用量占比图"},
+            "data": {
+                "values": [
+                    {"category": "token用量", "item": "input_cached", "value": 0},
+                    {"category": "token用量", "item": "input_uncached", "value": 0},
+                    {"category": "token用量", "item": "output", "value": 0},
+                    {"category": "token用量", "item": "sum_tokens", "value": 0},
+                ]
+            },
+            "xField": "value",
+            "yField": "category",
+            "seriesField": "item",
+            "stack": True,
+            "legends": {"visible": True, "orient": "bottom"},
+            "label": {"visible": True, "formatter": "value"},
+        }
+
+    def _build_streaming_card_json(
+        self,
+        text: str,
+        token_monitor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build a JSON 2.0 streaming card; chart is optional for compatibility."""
+        safe_text = text if text.strip() else "Generating..."
+        chart = self._default_token_chart()
+        if isinstance(token_monitor, dict) and isinstance(token_monitor.get("chart"), dict):
+            chart = token_monitor["chart"]
+
+        elements: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": safe_text,
+                "element_id": "answer_markdown",
+            }
+        ]
+        if isinstance(token_monitor, dict):
+            elements.append(
+                {
+                "tag": "hr",
+                "margin": "0px 0px 0px 0px",
+            }
+            )
+            elements.append(
+                {
+                    "tag": "chart",
+                    "chart_spec": chart,
+                    "element_id": "token_budget_chart",
+                    "color_theme": "complementary",
+                    "height": "50px",
+                    "margin": "0px 0px 0px 0px",
+                }
+            )
+
+        return {
+            "schema": "2.0",
+            "config": {
+                "update_multi": True,
+                "streaming_mode": True,
+                "summary": {"content": ""},
+                "streaming_config": {
+                    "print_frequency_ms": {
+                        "default": int(self.config.streaming_print_frequency_ms_default),
+                    },
+                    "print_step": {
+                        "default": int(self.config.streaming_print_step_default),
+                    },
+                    "print_strategy": self.config.streaming_print_strategy,
+                },
+            },
+            "body": {
+                "elements": elements
+            },
+        }
+
+    @staticmethod
+    def _build_card_id_message_content(card_id: str) -> str:
+        """Build im.v1.message content payload using card_id reference."""
+        payload = {
+            "type": "card",
+            "data": {
+                "card_id": card_id,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _build_sequence_uuid(sequence: int) -> str:
+        return f"nanobot-{sequence}-{uuid.uuid4()}"
+
+    async def _cardkit_create_card(self, card_json: dict[str, Any]) -> str:
+        """Create CardKit card entity and return card_id."""
+        payload = {
+            "type": "card_json",
+            "data": json.dumps(card_json, ensure_ascii=False, separators=(",", ":")),
+        }
+        data = await self._cardkit_request(
+            method="POST",
+            path="/open-apis/cardkit/v1/cards",
+            payload=payload,
+        )
+        card_id = (data.get("data") or {}).get("card_id")
+        if not card_id:
+            raise RuntimeError("CardKit create card missing card_id")
+        return str(card_id)
+
+    async def _cardkit_send_card_message(self, receive_id: str, receive_id_type: str, card_id: str) -> str:
+        """Send created card entity as an interactive message and return message_id."""
+        request = CreateMessageRequest.builder() \
+            .receive_id_type(receive_id_type) \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type("interactive")
+                .content(self._build_card_id_message_content(card_id))
+                .build()
+            ).build()
+
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Failed to send card_id message: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
+        message_id = getattr(response.data, "message_id", "") if response.data else ""
+        return str(message_id)
+
+    async def _cardkit_stream_text(self, card_id: str, element_id: str, full_text: str, sequence: int) -> None:
+        """Update markdown/plain_text content in streaming mode using full text."""
+        payload = {
+            "content": full_text,
+            "uuid": self._build_sequence_uuid(sequence),
+            "sequence": sequence,
+        }
+        await self._cardkit_request(
+            method="PUT",
+            path=f"/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content",
+            payload=payload,
+        )
+
+    async def _cardkit_update_settings(self, card_id: str, settings: dict[str, Any], sequence: int) -> None:
+        """Update card settings such as streaming_mode."""
+        payload = {
+            "settings": json.dumps(settings, ensure_ascii=False, separators=(",", ":")),
+            "uuid": self._build_sequence_uuid(sequence),
+            "sequence": sequence,
+        }
+        await self._cardkit_request(
+            method="PATCH",
+            path=f"/open-apis/cardkit/v1/cards/{card_id}/settings",
+            payload=payload,
+        )
+
+    async def _cardkit_request(self, method: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Issue one CardKit OpenAPI request with tenant token."""
+        token = await self._get_tenant_access_token()
+        url = f"https://open.feishu.cn{path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(method=method, url=url, headers=headers, json=payload)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"code": -1, "msg": response.text[:500]}
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                "CardKit HTTP error: "
+                f"status={response.status_code}, code={data.get('code')}, msg={data.get('msg')}, path={path}"
+            )
+
+        if data.get("code") != 0:
+            raise RuntimeError(f"CardKit API error: code={data.get('code')}, msg={data.get('msg')}, path={path}")
+        return data
     
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """

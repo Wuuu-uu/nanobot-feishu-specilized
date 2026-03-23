@@ -135,7 +135,13 @@ Then edit the config file inside that directory, for example `/data/home/scwb307
       "verificationToken": "",
       "allowFrom": [],
       "cardTemplateId": "AAqK6dMNHUVKE",
-      "cardTemplateVersionName": "1.0.0"
+      "cardTemplateVersionName": "1.0.0",
+      "streamingEnabled": true,
+      "streamingPrintFrequencyMsDefault": 70,
+      "streamingPrintStepDefault": 1,
+      "streamingPrintStrategy": "fast",
+      "streamingMaxUpdatesPerSec": 8,
+      "streamingFinalizeTimeoutSec": 15
     }
   },
   "tools": {
@@ -186,7 +192,7 @@ Then edit the config file inside that directory, for example `/data/home/scwb307
 
 1. Visit [Feishu Open Platform](https://open.feishu.cn/app)
 2. Create a new app → Enable **Bot** capability
-3. **Permissions**: Add `im:message` (send messages), `im:message:send_as_bot`, `im:resource` (download images), `im:message:readonly` (receive messages), `im:message.p2p_msg:readonly` (receive private messages), `docs:document.content:read` (read cloud document content)
+3. **Permissions**: Add `im:message` (send messages), `im:message:send_as_bot`, `im:resource` (download images), `im:message:readonly` (receive messages), `im:message.p2p_msg:readonly` (receive private messages), `docs:document.content:read` (read cloud document content), `cardkit:card:write` (create/update streaming cards)
 > **Note: ** As for multi-user senarios, you also need to add `contact:user.employee_id:readonly` to allow the bot to identify the user's Feishu ID.
 4. **Events**: Subscribe to `im.message.receive_v1` (receive messages)
    - Select **Long Connection** (WebSocket) mode — no public IP required

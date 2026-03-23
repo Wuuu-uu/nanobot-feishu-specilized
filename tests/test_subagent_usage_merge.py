@@ -19,11 +19,7 @@ def test_build_token_monitor_context_mode_with_budget() -> None:
     assert monitor["selected_budget_used_tokens"] == 90
     assert monitor["selected_budget_residue_tokens"] == 110
     values = monitor["chart"]["data"]["values"]
-    assert values[0]["item"] == "input_cached"
-    assert values[0]["value"] == 30
-    assert values[1]["item"] == "input_uncached"
-    assert values[1]["value"] == 40
-    assert values[2]["item"] == "output"
-    assert values[2]["value"] == 20
-    assert values[3]["item"] == "sum_tokens"
-    assert values[3]["value"] == 90
+    assert values[0]["item"] == "input"
+    assert values[0]["value"] == 70
+    assert values[1]["item"] == "output"
+    assert values[1]["value"] == 20
