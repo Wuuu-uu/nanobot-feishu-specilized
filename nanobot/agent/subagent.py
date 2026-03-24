@@ -17,6 +17,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.notion import NotionTool
 from nanobot.agent.tools.image_generate import ImageGenerateTool
+from nanobot.agent.tools.message import MessageTool
 
 
 class SubagentManager:
@@ -82,6 +83,63 @@ class SubagentManager:
         target["completion_tokens"] += cls._safe_int(usage.get("completion_tokens"))
         target["total_tokens"] += cls._safe_int(usage.get("total_tokens"))
         target["cache_tokens"] += cls._safe_int(usage.get("cache_tokens"))
+
+    def _build_token_monitor(self, usage: dict[str, int]) -> dict[str, Any]:
+        """Build token monitor metadata for subagent direct message sends."""
+        input_tokens = self._safe_int(usage.get("prompt_tokens"))
+        output_tokens = self._safe_int(usage.get("completion_tokens"))
+        cache_tokens = self._safe_int(usage.get("cache_tokens"))
+        total_tokens = self._safe_int(usage.get("total_tokens"))
+
+        output_budget = max(1, self._safe_int(self.max_tokens))
+        output_used = output_tokens
+        output_raw_residue = output_budget - output_used
+        output_residue = max(0, output_raw_residue)
+        output_ratio = min(1.0, output_used / output_budget)
+
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_tokens": cache_tokens,
+            "task_total_tokens": total_tokens,
+            "output_budget_total_tokens": output_budget,
+            "output_budget_used_tokens": output_used,
+            "output_budget_residue_tokens": output_residue,
+            "output_budget_usage_ratio": output_ratio,
+            "output_budget_usage_percent": round(output_ratio * 100, 2),
+            "output_budget_exceeded": output_raw_residue < 0,
+            "selected_budget_mode": "output",
+            "selected_budget_total_tokens": output_budget,
+            "selected_budget_used_tokens": output_used,
+            "selected_budget_residue_tokens": output_residue,
+            "selected_budget_usage_ratio": output_ratio,
+            "selected_budget_usage_percent": round(output_ratio * 100, 2),
+            "chart": {
+                "type": "bar",
+                "direction": "horizontal",
+                "title": {"text": "token用量占比图"},
+                "data": {
+                    "values": [
+                        {
+                            "category": "token用量",
+                            "item": "input",
+                            "value": input_tokens,
+                        },
+                        {
+                            "category": "token用量",
+                            "item": "output",
+                            "value": output_tokens,
+                        },
+                    ]
+                },
+                "xField": "value",
+                "yField": "category",
+                "seriesField": "item",
+                "stack": True,
+                "legends": {"visible": True, "orient": "bottom"},
+                "label": {"visible": True, "formatter": "value"},
+            },
+        }
     
     async def spawn(
         self,
@@ -133,7 +191,7 @@ class SubagentManager:
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            # Build subagent tools (no spawn tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(allowed_dir=allowed_dir))
@@ -178,6 +236,11 @@ class SubagentManager:
                 workspace=self.workspace,
                 allowed_dir=allowed_dir,
             ))
+
+            # Direct message send tool (supports Feishu card template and token monitor metadata)
+            message_tool = MessageTool(send_callback=self.bus.publish_outbound)
+            message_tool.set_context(origin["channel"], origin["chat_id"])
+            tools.register(message_tool)
             
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
@@ -196,6 +259,7 @@ class SubagentManager:
                 "total_tokens": 0,
                 "cache_tokens": 0,
             }
+            message_tool.set_token_monitor_factory(lambda: self._build_token_monitor(task_usage))
             
             while iteration < max_iterations:
                 iteration += 1
@@ -323,7 +387,6 @@ You are a subagent spawned by the main agent to complete a specific task.
 - Complete the task thoroughly
 
 ## What You Cannot Do
-- Send messages directly to users (no message tool available)
 - Spawn other subagents
 - Access the main agent's conversation history
 

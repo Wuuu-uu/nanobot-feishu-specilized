@@ -57,10 +57,18 @@ class _FeishuStreamState:
     card_id: str
     message_id: str
     element_id: str
+    tool_logs_element_id: str
     sequence: int = 1
     flushed_text: str = ""
     pending_text: str = ""
     last_flush_ts: float = 0.0
+    tool_logs_flushed_text: str = ""
+    tool_logs_pending_text: str = ""
+    tool_logs_last_flush_ts: float = 0.0
+    chart_element_id: str | None = None
+    chart_flushed_spec: dict[str, Any] | None = None
+    chart_pending_spec: dict[str, Any] | None = None
+    chart_last_flush_ts: float = 0.0
 
 
 class FeishuChannel(BaseChannel):
@@ -288,7 +296,11 @@ class FeishuChannel(BaseChannel):
     ) -> bool:
         """Handle Feishu CardKit streaming init/append/finalize lifecycle."""
         action = str(stream_payload.get("action", "")).strip().lower()
-        if action not in {"init", "append", "finalize"}:
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        if "token_monitor" not in stream_payload and isinstance(metadata.get("token_monitor"), dict):
+            stream_payload = dict(stream_payload)
+            stream_payload["token_monitor"] = metadata.get("token_monitor")
+        if action not in {"init", "tool_update", "append", "finalize"}:
             logger.warning(f"Unknown feishu_stream action: {action}")
             return False
 
@@ -315,6 +327,10 @@ class FeishuChannel(BaseChannel):
 
                 if action == "append":
                     await self._stream_append(msg, stream_payload, state)
+                    return True
+
+                if action == "tool_update":
+                    await self._stream_update_tool_logs(stream_payload, state)
                     return True
 
                 await self._stream_finalize(msg, stream_payload, stream_id, state)
@@ -366,10 +382,18 @@ class FeishuChannel(BaseChannel):
             card_id=card_id,
             message_id=message_id,
             element_id="answer_markdown",
+            tool_logs_element_id="tool_logs_markdown",
             sequence=1,
             flushed_text=initial_text,
             pending_text=initial_text,
             last_flush_ts=time.monotonic(),
+            tool_logs_flushed_text=self._default_tool_logs_markdown(),
+            tool_logs_pending_text=self._default_tool_logs_markdown(),
+            tool_logs_last_flush_ts=time.monotonic(),
+            chart_element_id="token_budget_chart" if isinstance(token_monitor, dict) else None,
+            chart_flushed_spec=self._chart_spec_from_token_monitor(token_monitor),
+            chart_pending_spec=self._chart_spec_from_token_monitor(token_monitor),
+            chart_last_flush_ts=time.monotonic(),
         )
         logger.debug(f"Feishu streaming initialized: stream_id={stream_id}, card_id={card_id}")
 
@@ -408,6 +432,84 @@ class FeishuChannel(BaseChannel):
         state.sequence += 1
         state.flushed_text = state.pending_text
         state.last_flush_ts = time.monotonic()
+        await self._stream_update_token_chart(stream_payload, state)
+
+    async def _stream_update_tool_logs(
+        self,
+        stream_payload: dict[str, Any],
+        state: _FeishuStreamState,
+    ) -> None:
+        """Push full tool logs markdown update to collapsible panel."""
+        logs_text = stream_payload.get("tool_logs_markdown")
+        if not isinstance(logs_text, str):
+            return
+
+        if not logs_text.strip():
+            logs_text = self._default_tool_logs_markdown()
+
+        state.tool_logs_pending_text = logs_text
+        force_flush = bool(stream_payload.get("force", False))
+        max_updates = max(1, int(self.config.streaming_max_updates_per_sec))
+        min_interval = 1.0 / max_updates
+        now = time.monotonic()
+        if not force_flush and (now - state.tool_logs_last_flush_ts) < min_interval:
+            return
+
+        if state.tool_logs_pending_text == state.tool_logs_flushed_text:
+            return
+
+        await self._cardkit_stream_text(
+            card_id=state.card_id,
+            element_id=state.tool_logs_element_id,
+            full_text=state.tool_logs_pending_text,
+            sequence=state.sequence,
+        )
+        state.sequence += 1
+        state.tool_logs_flushed_text = state.tool_logs_pending_text
+        state.tool_logs_last_flush_ts = time.monotonic()
+        await self._stream_update_token_chart(stream_payload, state)
+
+    async def _stream_update_token_chart(
+        self,
+        stream_payload: dict[str, Any],
+        state: _FeishuStreamState,
+    ) -> None:
+        """Keep token chart synchronized during tool and answer streaming."""
+        if not state.chart_element_id:
+            return
+
+        token_monitor = stream_payload.get("token_monitor")
+        if not isinstance(token_monitor, dict):
+            return
+
+        chart_spec = self._chart_spec_from_token_monitor(token_monitor)
+        if not isinstance(chart_spec, dict):
+            return
+
+        state.chart_pending_spec = chart_spec
+        if state.chart_pending_spec == state.chart_flushed_spec:
+            return
+
+        max_updates = max(1, int(self.config.streaming_max_updates_per_sec))
+        min_interval = 1.0 / max_updates
+        now = time.monotonic()
+        if (now - state.chart_last_flush_ts) < min_interval and not bool(stream_payload.get("force", False)):
+            return
+
+        try:
+            await self._cardkit_patch_element(
+                card_id=state.card_id,
+                element_id=state.chart_element_id,
+                partial_element={"chart_spec": state.chart_pending_spec},
+                sequence=state.sequence,
+            )
+            state.sequence += 1
+            state.chart_flushed_spec = state.chart_pending_spec
+            state.chart_last_flush_ts = time.monotonic()
+        except Exception as e:
+            # Do not let chart refresh errors break the whole streaming lifecycle.
+            logger.warning(f"Failed to update token chart, disabling chart updates for this stream: {e}")
+            state.chart_element_id = None
 
     async def _stream_finalize(
         self,
@@ -433,6 +535,18 @@ class FeishuChannel(BaseChannel):
             )
             state.sequence += 1
             state.flushed_text = state.pending_text
+
+        if state.tool_logs_pending_text and state.tool_logs_pending_text != state.tool_logs_flushed_text:
+            await self._cardkit_stream_text(
+                card_id=state.card_id,
+                element_id=state.tool_logs_element_id,
+                full_text=state.tool_logs_pending_text,
+                sequence=state.sequence,
+            )
+            state.sequence += 1
+            state.tool_logs_flushed_text = state.tool_logs_pending_text
+
+        await self._stream_update_token_chart(stream_payload, state)
 
         await self._cardkit_update_settings(
             card_id=state.card_id,
@@ -604,6 +718,13 @@ class FeishuChannel(BaseChannel):
             alt_text = match.group(1)
             raw_url = match.group(2)
 
+            normalized_url = raw_url.strip()
+            if normalized_url.startswith("<") and ">" in normalized_url:
+                normalized_url = normalized_url[1:normalized_url.find(">")]
+            else:
+                normalized_url = normalized_url.split(maxsplit=1)[0]
+            lowered_url = normalized_url.lower()
+
             replacement = match.group(0)
             local_path = self._resolve_local_md_image_path(raw_url)
             if local_path:
@@ -617,6 +738,11 @@ class FeishuChannel(BaseChannel):
                         key = None
                 if key:
                     replacement = f"![{alt_text}]({key})"
+            elif not lowered_url.startswith(("http://", "https://", "data:")) and not normalized_url.startswith("img_v"):
+                # Prevent CardKit from treating unresolved local file names as invalid image keys.
+                fallback_name = Path(unquote(normalized_url)).name or normalized_url
+                fallback_alt = alt_text.strip() or fallback_name or "local-image"
+                replacement = f"[image omitted: {fallback_alt}]"
 
             parts.append(replacement)
             last = match.end()
@@ -692,6 +818,18 @@ class FeishuChannel(BaseChannel):
             "label": {"visible": True, "formatter": "value"},
         }
 
+    @staticmethod
+    def _default_tool_logs_markdown() -> str:
+        return "工具调用记录\n暂无工具调用。"
+
+    def _chart_spec_from_token_monitor(self, token_monitor: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(token_monitor, dict):
+            return None
+        chart = token_monitor.get("chart")
+        if isinstance(chart, dict):
+            return chart
+        return self._default_token_chart()
+
     def _build_streaming_card_json(
         self,
         text: str,
@@ -704,6 +842,38 @@ class FeishuChannel(BaseChannel):
             chart = token_monitor["chart"]
 
         elements: list[dict[str, Any]] = [
+            {
+                "tag": "collapsible_panel",
+                "element_id": "tool_logs_panel",
+                "expanded": False,
+                "vertical_spacing": "8px",
+                "padding": "8px 8px 8px 8px",
+                "header": {
+                    "title": {
+                        "tag": "markdown",
+                        "content": "**工具调用详情**",
+                    },
+                    "icon": {
+                        "tag": "standard_icon",
+                        "token": "down-small-ccm_outlined",
+                        "size": "16px 16px",
+                    },
+                    "icon_position": "right",
+                    "icon_expanded_angle": -180,
+                },
+                "border": {
+                    "color": "grey",
+                    "corner_radius": "5px",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "element_id": "tool_logs_markdown",
+                        "text_size": "notation",
+                        "content": self._default_tool_logs_markdown(),
+                    }
+                ],
+            },
             {
                 "tag": "markdown",
                 "content": safe_text,
@@ -800,16 +970,50 @@ class FeishuChannel(BaseChannel):
         message_id = getattr(response.data, "message_id", "") if response.data else ""
         return str(message_id)
 
-    async def _cardkit_stream_text(self, card_id: str, element_id: str, full_text: str, sequence: int) -> None:
-        """Update markdown/plain_text content in streaming mode using full text."""
+    async def _cardkit_stream_element_content(
+        self,
+        card_id: str,
+        element_id: str,
+        content: Any,
+        sequence: int,
+    ) -> None:
+        """Update element content for streaming-capable CardKit element."""
         payload = {
-            "content": full_text,
+            "content": content,
             "uuid": self._build_sequence_uuid(sequence),
             "sequence": sequence,
         }
         await self._cardkit_request(
             method="PUT",
             path=f"/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content",
+            payload=payload,
+        )
+
+    async def _cardkit_stream_text(self, card_id: str, element_id: str, full_text: str, sequence: int) -> None:
+        """Update markdown/plain_text content in streaming mode using full text."""
+        await self._cardkit_stream_element_content(
+            card_id=card_id,
+            element_id=element_id,
+            content=full_text,
+            sequence=sequence,
+        )
+
+    async def _cardkit_patch_element(
+        self,
+        card_id: str,
+        element_id: str,
+        partial_element: dict[str, Any],
+        sequence: int,
+    ) -> None:
+        """Patch one CardKit element property set (e.g. chart_spec)."""
+        payload = {
+            "partial_element": json.dumps(partial_element, ensure_ascii=False, separators=(",", ":")),
+            "uuid": self._build_sequence_uuid(sequence),
+            "sequence": sequence,
+        }
+        await self._cardkit_request(
+            method="PATCH",
+            path=f"/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}",
             payload=payload,
         )
 

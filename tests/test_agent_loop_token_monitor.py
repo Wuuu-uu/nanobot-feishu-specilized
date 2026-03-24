@@ -39,3 +39,21 @@ def test_build_token_monitor_chart_values_match_usage() -> None:
     values = monitor["chart"]["data"]["values"]
     assert values[0] == {"category": "token用量", "item": "input", "value": 50}
     assert values[1] == {"category": "token用量", "item": "output", "value": 30}
+
+
+def test_build_token_monitor_chart_includes_tool_calls_when_provided() -> None:
+    monitor = AgentLoop._build_token_monitor(
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cache_tokens": 0,
+        },
+        output_budget_tokens=100,
+        context_window_tokens=0,
+        token_budget_mode="output",
+        tool_calls_completed=3,
+    )
+
+    values = monitor["chart"]["data"]["values"]
+    assert {"category": "token用量", "item": "tool_calls", "value": 3} in values

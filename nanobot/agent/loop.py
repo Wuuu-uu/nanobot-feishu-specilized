@@ -202,6 +202,7 @@ class AgentLoop:
         output_budget_tokens: int,
         context_window_tokens: int = 0,
         token_budget_mode: str = "output",
+        tool_calls_completed: int = 0,
     ) -> dict[str, Any]:
         input_tokens = cls._safe_int(usage.get("prompt_tokens"))
         output_tokens = cls._safe_int(usage.get("completion_tokens"))
@@ -226,6 +227,28 @@ class AgentLoop:
         selected_budget = context_budget if effective_mode == "context" else output_budget
         selected_used = context_used if effective_mode == "context" else output_used
         selected_ratio = context_ratio if effective_mode == "context" else output_ratio
+
+        chart_values = [
+            {
+                "category": "token用量",
+                "item": "input",
+                "value": input_tokens,
+            },
+            {
+                "category": "token用量",
+                "item": "output",
+                "value": output_tokens,
+            },
+        ]
+        completed_tools = max(0, cls._safe_int(tool_calls_completed))
+        if completed_tools > 0:
+            chart_values.append(
+                {
+                    "category": "token用量",
+                    "item": "tool_calls",
+                    "value": completed_tools,
+                }
+            )
 
         return {
             "input_tokens": input_tokens,
@@ -256,18 +279,7 @@ class AgentLoop:
                 "direction": "horizontal",
                 "title": {"text": "token用量占比图"},
                 "data": {
-                    "values": [
-                        {
-                            "category": "token用量",
-                            "item": "input",
-                            "value": input_tokens,
-                        },
-                        {
-                            "category": "token用量",
-                            "item": "output",
-                            "value": output_tokens,
-                        },
-                    ]
+                    "values": chart_values
                 },
                 "xField": "value",
                 "yField": "category",
@@ -463,6 +475,12 @@ class AgentLoop:
                 )
             )
 
+        feishu_stream_enabled = msg.channel == "feishu" and self.feishu_config.streaming_enabled
+        stream_id = self._build_stream_id(msg) if feishu_stream_enabled else ""
+        stream_initialized = False
+        tool_log_entries: list[str] = []
+        completed_tool_calls = 0
+
         session.add_message("user", msg.content)
         try:
             while iteration < self.max_iterations:
@@ -503,27 +521,90 @@ class AgentLoop:
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments, indent=2, ensure_ascii=False)
                         logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                        push_message = OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content=(
-                                f"🛠️**正在调用工具**： `{tool_call.name}`\n"
-                                f"🔢**参数列表**：\n"
-                                f"```json\n{args_str}\n```"
-                            ),
-                            metadata={
-                                "token_monitor": self._build_token_monitor(
+                        if feishu_stream_enabled:
+                            if not stream_initialized:
+                                await self._publish_feishu_stream_init(
+                                    msg=msg,
+                                    stream_id=stream_id,
+                                    token_monitor=self._build_token_monitor(
+                                        task_usage,
+                                        self.max_tokens,
+                                        self.context_window_tokens,
+                                        self.token_budget_mode,
+                                        tool_calls_completed=completed_tool_calls,
+                                    ),
+                                    initial_text="正在调用工具，请稍候...",
+                                )
+                                stream_initialized = True
+
+                            entry_prefix = f"###### {len(tool_log_entries) + 1}. `{tool_call.name}`"
+                            args_preview = self._truncate_text(args_str, 2000)
+                            tool_log_entries.append(
+                                (
+                                    f"{entry_prefix}\n"
+                                    f"- 状态: 执行中\n"
+                                    f"- 参数:\n"
+                                    f"```json\n{args_preview}\n```"
+                                )
+                            )
+                            await self._publish_feishu_tool_update(
+                                msg=msg,
+                                stream_id=stream_id,
+                                tool_logs_markdown=self._build_tool_panel_markdown(tool_log_entries),
+                                token_monitor=self._build_token_monitor(
                                     task_usage,
                                     self.max_tokens,
                                     self.context_window_tokens,
                                     self.token_budget_mode,
-                                )
-                            },
-                        )
-                        await self.bus.publish_outbound(push_message)
+                                    tool_calls_completed=completed_tool_calls,
+                                ),
+                            )
+                        else:
+                            push_message = OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=(
+                                    f"🛠️**正在调用工具**： `{tool_call.name}`\n"
+                                    f"🔢**参数列表**：\n"
+                                    f"```json\n{args_str}\n```"
+                                ),
+                                metadata={
+                                    "token_monitor": self._build_token_monitor(
+                                        task_usage,
+                                        self.max_tokens,
+                                        self.context_window_tokens,
+                                        self.token_budget_mode,
+                                    )
+                                },
+                            )
+                            await self.bus.publish_outbound(push_message)
                         started = time.perf_counter()
                         result = await self.tools.execute(tool_call.name, tool_call.arguments)
                         result_text = result if isinstance(result, str) else str(result)
+                        completed_tool_calls += 1
+
+                        if feishu_stream_enabled and tool_log_entries:
+                            elapsed = time.perf_counter() - started
+                            entry_prefix = f"###### {len(tool_log_entries)}. `{tool_call.name}`"
+                            args_preview = self._truncate_text(args_str, 2000)
+                            tool_log_entries[-1] = (
+                                f"{entry_prefix}\n"
+                                f"- 状态: 已完成 ({elapsed:.2f}s)\n"
+                                f"- 参数:\n"
+                                f"```json\n{args_preview}\n```"
+                            )
+                            await self._publish_feishu_tool_update(
+                                msg=msg,
+                                stream_id=stream_id,
+                                tool_logs_markdown=self._build_tool_panel_markdown(tool_log_entries),
+                                token_monitor=self._build_token_monitor(
+                                    task_usage,
+                                    self.max_tokens,
+                                    self.context_window_tokens,
+                                    self.token_budget_mode,
+                                    tool_calls_completed=completed_tool_calls,
+                                ),
+                            )
                         
                         # Instead of _record_tool_event digest, append natively
                         session.add_message("tool", result_text, tool_call_id=tool_call.id, name=tool_call.name)
@@ -552,10 +633,17 @@ class AgentLoop:
             self.max_tokens,
             self.context_window_tokens,
             self.token_budget_mode,
+            tool_calls_completed=completed_tool_calls if feishu_stream_enabled else 0,
         )
 
         if self._should_publish_feishu_streaming(msg, final_content):
-            await self._publish_feishu_streaming_response(msg, final_content, token_monitor)
+            await self._publish_feishu_streaming_response(
+                msg,
+                final_content,
+                token_monitor,
+                stream_id=stream_id,
+                send_init=not stream_initialized,
+            )
             return None
         
         return OutboundMessage(
@@ -573,17 +661,53 @@ class AgentLoop:
             and bool(final_content)
         )
 
-    async def _publish_feishu_streaming_response(
+    @staticmethod
+    def _build_stream_id(msg: InboundMessage) -> str:
+        """Generate one stream identifier shared across tool logs and final answer."""
+        return f"{msg.channel}:{msg.chat_id}:{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _truncate_text(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return f"{value[:limit]}\n...\n(内容已截断，原始长度: {len(value)} 字符)"
+
+    def _build_tool_panel_markdown(self, entries: list[str]) -> str:
+        header = "###### 工具调用记录"
+        if not entries:
+            return f"{header}\n\n暂无工具调用。"
+        return f"{header}\n\n" + "\n\n".join(entries)
+
+    async def _publish_feishu_stream_init(
         self,
         msg: InboundMessage,
-        final_content: str,
+        stream_id: str,
+        token_monitor: dict[str, Any],
+        initial_text: str = "",
+    ) -> None:
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=initial_text,
+                metadata={
+                    "token_monitor": token_monitor,
+                    "feishu_stream": {
+                        "action": "init",
+                        "stream_id": stream_id,
+                        "full_text": initial_text,
+                    },
+                },
+            )
+        )
+
+    async def _publish_feishu_tool_update(
+        self,
+        msg: InboundMessage,
+        stream_id: str,
+        tool_logs_markdown: str,
         token_monitor: dict[str, Any],
     ) -> None:
-        """Publish init/append/finalize events consumed by FeishuChannel streaming state machine."""
-        stream_id = f"{msg.channel}:{msg.chat_id}:{int(time.time() * 1000)}"
-        chunk_chars = max(20, int(self.feishu_config.streaming_print_step_default) * 16)
-        interval = max(0.08, float(self.feishu_config.streaming_print_frequency_ms_default) / 1000.0 * 4.0)
-
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=msg.channel,
@@ -592,13 +716,35 @@ class AgentLoop:
                 metadata={
                     "token_monitor": token_monitor,
                     "feishu_stream": {
-                        "action": "init",
+                        "action": "tool_update",
                         "stream_id": stream_id,
-                        "full_text": "",
+                        "tool_logs_markdown": tool_logs_markdown,
+                        "force": True,
                     },
                 },
             )
         )
+
+    async def _publish_feishu_streaming_response(
+        self,
+        msg: InboundMessage,
+        final_content: str,
+        token_monitor: dict[str, Any],
+        stream_id: str | None = None,
+        send_init: bool = True,
+    ) -> None:
+        """Publish init/append/finalize events consumed by FeishuChannel streaming state machine."""
+        stream_id = stream_id or self._build_stream_id(msg)
+        chunk_chars = max(20, int(self.feishu_config.streaming_print_step_default) * 16)
+        interval = max(0.08, float(self.feishu_config.streaming_print_frequency_ms_default) / 1000.0 * 4.0)
+
+        if send_init:
+            await self._publish_feishu_stream_init(
+                msg=msg,
+                stream_id=stream_id,
+                token_monitor=token_monitor,
+                initial_text="",
+            )
 
         total = len(final_content)
         cursor = 0

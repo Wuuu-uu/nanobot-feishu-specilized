@@ -1,4 +1,5 @@
 import json
+import asyncio
 
 from nanobot.channels.feishu import FeishuChannel
 from nanobot.bus.queue import MessageBus
@@ -82,8 +83,15 @@ def test_build_streaming_card_json_contains_streaming_config() -> None:
     assert card["config"]["streaming_config"]["print_frequency_ms"]["default"] == channel.config.streaming_print_frequency_ms_default
     assert card["config"]["streaming_config"]["print_step"]["default"] == channel.config.streaming_print_step_default
     assert card["config"]["streaming_config"]["print_strategy"] == channel.config.streaming_print_strategy
-    assert card["body"]["elements"][0]["element_id"] == "answer_markdown"
-    assert card["body"]["elements"][0]["content"] == "Generating..."
+    assert card["body"]["elements"][0]["tag"] == "collapsible_panel"
+    assert card["body"]["elements"][0]["expanded"] is False
+    tool_elements = card["body"]["elements"][0]["elements"]
+    assert len(tool_elements) == 1
+    assert tool_elements[0]["element_id"] == "tool_logs_markdown"
+    assert tool_elements[0]["text_size"] == "notation"
+    assert "暂无工具调用" in tool_elements[0]["content"]
+    assert card["body"]["elements"][1]["element_id"] == "answer_markdown"
+    assert card["body"]["elements"][1]["content"] == "Generating..."
 
 
 def test_build_streaming_card_json_includes_token_chart_when_provided() -> None:
@@ -103,8 +111,56 @@ def test_build_streaming_card_json_includes_token_chart_when_provided() -> None:
     )
 
     elements = card["body"]["elements"]
-    assert len(elements) >= 2
-    assert elements[0]["tag"] == "markdown"
+    assert len(elements) >= 3
+    assert elements[0]["tag"] == "collapsible_panel"
+    assert elements[1]["tag"] == "markdown"
     chart_elements = [el for el in elements if el.get("tag") == "chart"]
     assert len(chart_elements) == 1
     assert chart_elements[0]["element_id"] == "token_budget_chart"
+
+
+def test_cardkit_patch_element_serializes_partial_element(monkeypatch) -> None:
+    channel = FeishuChannel(FeishuConfig(streaming_enabled=True), MessageBus())
+    captured: dict[str, object] = {}
+
+    async def fake_request(method: str, path: str, payload: dict[str, object]) -> dict[str, object]:
+        captured["method"] = method
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"code": 0, "msg": "success", "data": {}}
+
+    monkeypatch.setattr(channel, "_cardkit_request", fake_request)
+
+    asyncio.run(
+        channel._cardkit_patch_element(
+            card_id="c1",
+            element_id="token_budget_chart",
+            partial_element={"chart_spec": {"type": "bar", "data": {"values": []}}},
+            sequence=3,
+        )
+    )
+
+    assert captured["method"] == "PATCH"
+    assert captured["path"] == "/open-apis/cardkit/v1/cards/c1/elements/token_budget_chart"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    partial = payload.get("partial_element")
+    assert isinstance(partial, str)
+    decoded = json.loads(partial)
+    assert decoded["chart_spec"]["type"] == "bar"
+    assert payload.get("sequence") == 3
+
+
+def test_replace_local_md_images_with_keys_sanitizes_unresolved_local_images() -> None:
+    channel = FeishuChannel(FeishuConfig(streaming_enabled=True), MessageBus())
+    text = "before ![arch](fig_esm2_arch.png) after"
+    updated = asyncio.run(channel._replace_local_md_images_with_keys(text))
+    assert "fig_esm2_arch.png" not in updated
+    assert "[image omitted: arch]" in updated
+
+
+def test_replace_local_md_images_with_keys_keeps_remote_images() -> None:
+    channel = FeishuChannel(FeishuConfig(streaming_enabled=True), MessageBus())
+    text = "![remote](https://example.com/a.png)"
+    updated = asyncio.run(channel._replace_local_md_images_with_keys(text))
+    assert updated == text

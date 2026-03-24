@@ -36,7 +36,7 @@ class FeishuConfig(BaseModel):
     card_template_version_name: str = "1.0.0"  # Card template version used for outbound interactive messages
     streaming_enabled: bool = False  # Enable CardKit streaming mode for outbound card updates
     streaming_print_frequency_ms_default: int = 50  # Client render frequency in ms
-    streaming_print_step_default: int = 3  # Client render step (characters per tick)
+    streaming_print_step_default: int = 1  # Client render step (characters per tick)
     streaming_print_strategy: Literal["fast", "delay"] = "delay"  # Streaming print policy
     streaming_max_updates_per_sec: int = 8  # Local throttling guard for update requests
     streaming_finalize_timeout_sec: int = 15  # Reserved timeout for graceful finalize/cleanup
