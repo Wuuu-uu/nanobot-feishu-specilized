@@ -848,11 +848,13 @@ class FeishuChannel(BaseChannel):
                 "expanded": False,
                 "vertical_spacing": "8px",
                 "padding": "8px 8px 8px 8px",
+                "background_color": "grey",
                 "header": {
                     "title": {
                         "tag": "markdown",
                         "content": "**工具调用详情**",
                     },
+                    "background_color": "grey",
                     "icon": {
                         "tag": "standard_icon",
                         "token": "down-small-ccm_outlined",
