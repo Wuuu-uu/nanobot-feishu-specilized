@@ -511,6 +511,7 @@ class AgentLoop:
         feishu_stream_enabled = msg.channel == "feishu" and self.feishu_config.streaming_enabled
         stream_id = self._build_stream_id(msg) if feishu_stream_enabled else ""
         stream_initialized = False
+        stream_started_at: float | None = None
         tool_log_entries: list[str] = []
         completed_tool_calls = 0
 
@@ -570,6 +571,7 @@ class AgentLoop:
                                     initial_text="正在调用工具，请稍候...",
                                 )
                                 stream_initialized = True
+                                stream_started_at = time.time()
 
                             call_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             entry_prefix = f"###### {len(tool_log_entries) + 1}. `{tool_call.name}`"
@@ -680,6 +682,7 @@ class AgentLoop:
                 token_monitor,
                 stream_id=stream_id,
                 send_init=not stream_initialized,
+                stream_started_at=stream_started_at,
             )
             return None
         
@@ -805,13 +808,14 @@ class AgentLoop:
         token_monitor: dict[str, Any],
         stream_id: str | None = None,
         send_init: bool = True,
+        stream_started_at: float | None = None,
     ) -> None:
         """Publish init/append/finalize events consumed by FeishuChannel streaming state machine."""
         stream_id = stream_id or self._build_stream_id(msg)
         chunk_chars = max(20, int(self.feishu_config.streaming_print_step_default) * 16)
         interval = max(0.08, float(self.feishu_config.streaming_print_frequency_ms_default) / 1000.0 * 4.0)
         timeout_sec = max(1, int(self.feishu_config.streaming_preemptive_timeout_sec))
-        stream_start_time = time.time()
+        stream_start_time = stream_started_at
 
         if send_init:
             await self._publish_feishu_stream_init(
@@ -820,6 +824,11 @@ class AgentLoop:
                 token_monitor=token_monitor,
                 initial_text="",
             )
+            if stream_start_time is None:
+                stream_start_time = time.time()
+
+        if stream_start_time is None:
+            stream_start_time = time.time()
 
         total = len(final_content)
         cursor = 0

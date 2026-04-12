@@ -87,3 +87,31 @@ def test_streaming_within_window_keeps_finalize_flow(monkeypatch) -> None:
     assert outbound[2].metadata["feishu_stream"]["action"] == "append"
     assert outbound[3].metadata["feishu_stream"]["action"] == "finalize"
     assert outbound[3].metadata["feishu_stream"]["full_text"] == final_content
+
+
+def test_timeout_uses_stream_init_baseline(monkeypatch) -> None:
+    loop = _make_loop()
+    msg = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="hello")
+    final_content = "C" * 60
+    token_monitor = {"chart": {"type": "bar", "data": {"values": []}}}
+
+    # Simulate entering final-answer stage when stream has already been open for >8 minutes.
+    times = iter([1000.0, 1001.0])
+    monkeypatch.setattr("nanobot.agent.loop.time.time", lambda: next(times))
+
+    asyncio.run(
+        loop._publish_feishu_streaming_response(
+            msg=msg,
+            final_content=final_content,
+            token_monitor=token_monitor,
+            stream_id="s3",
+            send_init=False,
+            stream_started_at=500.0,
+        )
+    )
+
+    outbound = _collect_outbound(loop.bus)
+    assert len(outbound) == 3
+    assert outbound[0].metadata["feishu_stream"]["action"] == "finalize"
+    assert outbound[1].content.startswith("当前回答已超出流式窗口限制")
+    assert outbound[2].content == "C" * 40
