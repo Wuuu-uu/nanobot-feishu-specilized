@@ -65,3 +65,36 @@ def test_get_history_repairs_unpaired_tool_message_after_separate_limit() -> Non
     # so the tool message without its assistant tool_calls envelope must be dropped.
     assert [m["role"] for m in history] == ["user", "assistant"]
     assert [m["content"] for m in history] == ["u1", "a1"]
+
+
+def test_get_history_skips_timeout_events_without_breaking_tool_pairs() -> None:
+    session = Session(key="cli:test-timeout-events")
+
+    session.add_message("assistant", "", tool_calls=[_assistant_tool_call("tc1")])
+    session.add_message("tool", "tool-result-1", tool_call_id="tc1", name="read_file")
+    session.add_message("assistant", "final-answer")
+
+    # Timeout transport events are persisted for audit, but excluded from model context.
+    session.add_message(
+        "assistant",
+        "stream timeout notice",
+        include_in_context=False,
+        event_type="streaming_timeout",
+    )
+    session.add_message(
+        "assistant",
+        "fallback continuation",
+        include_in_context=False,
+        event_type="timeout_fallback",
+    )
+
+    history = session.get_history(
+        max_messages=50,
+        max_dialog_messages=5,
+        max_tool_messages=5,
+    )
+
+    assert [m["role"] for m in history] == ["assistant", "tool", "assistant"]
+    assert history[0]["tool_calls"][0]["id"] == "tc1"
+    assert history[1]["tool_call_id"] == "tc1"
+    assert history[2]["content"] == "final-answer"

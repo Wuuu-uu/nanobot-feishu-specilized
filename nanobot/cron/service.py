@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
@@ -77,6 +77,8 @@ class CronService:
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
+                            command=j["payload"].get("command", ""),
+                            timeout_s=j["payload"].get("timeoutS"),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
@@ -124,6 +126,8 @@ class CronService:
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
+                        "command": j.payload.command,
+                        "timeoutS": j.payload.timeout_s,
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
@@ -258,7 +262,10 @@ class CronService:
         self,
         name: str,
         schedule: CronSchedule,
-        message: str,
+        message: str = "",
+        kind: Literal["system_event", "agent_turn", "exec"] = "agent_turn",
+        command: str = "",
+        timeout_s: int | None = None,
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
@@ -267,6 +274,19 @@ class CronService:
         """Add a new job."""
         store = self._load_store()
         now = _now_ms()
+
+        normalized_message = message or ""
+        normalized_command = (command or "").strip()
+        if kind == "exec":
+            # Backward compatibility: allow passing RUN:xxx in message only.
+            if not normalized_command and normalized_message.strip().startswith("RUN:"):
+                normalized_command = normalized_message.strip()[4:].strip()
+            if not normalized_command:
+                raise ValueError("command is required for exec cron jobs")
+        elif not normalized_message.strip():
+            raise ValueError("message is required for non-exec cron jobs")
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError("timeout_s must be > 0")
         
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -274,8 +294,10 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
-                message=message,
+                kind=kind,
+                message=normalized_message,
+                command=normalized_command,
+                timeout_s=timeout_s,
                 deliver=deliver,
                 channel=channel,
                 to=to,

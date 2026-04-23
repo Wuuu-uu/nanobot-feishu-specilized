@@ -563,6 +563,9 @@ class AgentLoop:
                     
                     # Persist tool calls onto session list natively
                     session.add_message("assistant", response.content, tool_calls=tool_call_dicts)
+                    if feishu_stream_enabled:
+                        # Persist checkpoint before potential long-running tool execution.
+                        self.sessions.save(session)
                     
                     # Execute tools
                     for tool_call in response.tool_calls:
@@ -660,6 +663,8 @@ class AgentLoop:
                         
                         # Instead of _record_tool_event digest, append natively
                         session.add_message("tool", result_text, tool_call_id=tool_call.id, name=tool_call.name)
+                        if feishu_stream_enabled:
+                            self.sessions.save(session)
                         
                         messages = self.context.add_tool_result(
                             messages, tool_call.id, tool_call.name, result
@@ -696,6 +701,7 @@ class AgentLoop:
                 stream_id=stream_id,
                 send_init=not stream_initialized,
                 stream_started_at=stream_started_at,
+                session=session,
             )
             return None
         
@@ -822,6 +828,7 @@ class AgentLoop:
         stream_id: str | None = None,
         send_init: bool = True,
         stream_started_at: float | None = None,
+        session: Session | None = None,
     ) -> None:
         """Publish init/append/finalize events consumed by FeishuChannel streaming state machine."""
         stream_id = stream_id or self._build_stream_id(msg)
@@ -866,8 +873,10 @@ class AgentLoop:
                 )
                 await self._publish_feishu_timeout_fallback(
                     msg=msg,
-                    remaining_content=final_content[next_cursor:],
+                    remaining_content=final_content[cursor:],
                     token_monitor=token_monitor,
+                    session=session,
+                    stream_id=stream_id,
                 )
                 return
 
@@ -911,15 +920,24 @@ class AgentLoop:
         msg: InboundMessage,
         remaining_content: str,
         token_monitor: dict[str, Any],
+        session: Session | None = None,
+        stream_id: str = "",
     ) -> None:
         """Send non-streaming continuation once preemptive timeout is reached."""
+        timeout_notice = "当前回答已超出流式窗口限制，后续内容将切换为普通消息继续发送。"
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="当前回答已超出流式窗口限制，后续内容将切换为普通消息继续发送。",
+                content=timeout_notice,
                 metadata={"token_monitor": token_monitor},
             )
+        )
+        self._record_feishu_timeout_event(
+            session=session,
+            stream_id=stream_id,
+            event_type="streaming_timeout",
+            content=timeout_notice,
         )
 
         if not remaining_content:
@@ -933,6 +951,32 @@ class AgentLoop:
                 metadata={"token_monitor": token_monitor},
             )
         )
+        self._record_feishu_timeout_event(
+            session=session,
+            stream_id=stream_id,
+            event_type="timeout_fallback",
+            content=remaining_content,
+        )
+
+    def _record_feishu_timeout_event(
+        self,
+        session: Session | None,
+        stream_id: str,
+        event_type: str,
+        content: str,
+    ) -> None:
+        """Persist timeout/fallback transport events without polluting future model context."""
+        if session is None:
+            return
+
+        session.add_message(
+            "assistant",
+            content,
+            include_in_context=False,
+            event_type=event_type,
+            stream_id=stream_id,
+        )
+        self.sessions.save(session)
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """

@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -198,6 +199,39 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
+
+    def _truncate_text(text: str, limit: int = 4000) -> str:
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n...[truncated]"
+
+    async def _run_cron_command(command: str, timeout_s: int) -> tuple[int, str, str, bool]:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(config.workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return 124, "", f"Timed out after {timeout_s}s", True
+
+        stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+        return proc.returncode or 0, stdout, stderr, False
+
+    async def _publish_cron_delivery(channel: str, chat_id: str, content: str) -> None:
+        from nanobot.bus.events import OutboundMessage
+
+        await bus.publish_outbound(OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+        ))
     
     # Create agent with cron service
     agent = AgentLoop(
@@ -227,6 +261,41 @@ def gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        is_legacy_run = (
+            job.payload.kind == "agent_turn"
+            and job.payload.message.strip().startswith("RUN:")
+        )
+        if job.payload.kind == "exec" or is_legacy_run:
+            command = (job.payload.command or "").strip()
+            if not command and is_legacy_run:
+                command = job.payload.message.strip()[4:].strip()
+            if not command:
+                raise ValueError("Cron exec job missing command")
+
+            timeout_s = job.payload.timeout_s or int(config.tools.exec.timeout)
+            timeout_s = max(1, timeout_s)
+            exit_code, stdout, stderr, timed_out = await _run_cron_command(command, timeout_s)
+
+            lines = [
+                f"[cron] exec: {command}",
+                f"[cron] cwd: {config.workspace_path}",
+                f"[cron] exit_code: {exit_code}",
+            ]
+            if timed_out:
+                lines.append(f"[cron] timeout: {timeout_s}s")
+            if stdout.strip():
+                lines.append("[cron] stdout:\n" + _truncate_text(stdout))
+            if stderr.strip():
+                lines.append("[cron] stderr:\n" + _truncate_text(stderr))
+            response = "\n".join(lines)
+
+            if job.payload.deliver and job.payload.to:
+                await _publish_cron_delivery(job.payload.channel or "cli", job.payload.to, response)
+
+            if timed_out or exit_code != 0:
+                raise RuntimeError(response)
+            return response
+
         response = await agent.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
@@ -234,12 +303,7 @@ def gateway(
             chat_id=job.payload.to or "direct",
         )
         if job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response or ""
-            ))
+            await _publish_cron_delivery(job.payload.channel or "cli", job.payload.to, response or "")
         return response
     cron.on_job = on_cron_job
     
@@ -801,6 +865,7 @@ def cron_list(
     table.add_column("ID", style="cyan")
     table.add_column("Name")
     table.add_column("Schedule")
+    table.add_column("Payload")
     table.add_column("Status")
     table.add_column("Next Run")
     
@@ -819,10 +884,20 @@ def cron_list(
         if job.state.next_run_at_ms:
             next_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(job.state.next_run_at_ms / 1000))
             next_run = next_time
+
+        payload_desc = job.payload.kind
+        if job.payload.kind == "exec":
+            cmd = (job.payload.command or "").strip()
+            if not cmd and job.payload.message.strip().startswith("RUN:"):
+                cmd = job.payload.message.strip()[4:].strip()
+            if cmd:
+                payload_desc = f"exec: {cmd[:40]}"
+        elif job.payload.kind == "agent_turn" and job.payload.message.strip().startswith("RUN:"):
+            payload_desc = "agent_turn (RUN: legacy)"
         
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
         
-        table.add_row(job.id, job.name, sched, status, next_run)
+        table.add_row(job.id, job.name, sched, payload_desc, status, next_run)
     
     console.print(table)
 
@@ -830,7 +905,9 @@ def cron_list(
 @cron_app.command("add")
 def cron_add(
     name: str = typer.Option(..., "--name", "-n", help="Job name"),
-    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    message: str = typer.Option("", "--message", "-m", help="Message for agent"),
+    command: str = typer.Option(None, "--command", help="Shell command to execute directly"),
+    timeout: int = typer.Option(None, "--timeout", help="Timeout in seconds for --command"),
     every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
     cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
@@ -855,6 +932,24 @@ def cron_add(
     else:
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
+
+    if timeout is not None and timeout <= 0:
+        console.print("[red]Error: --timeout must be > 0[/red]")
+        raise typer.Exit(1)
+
+    payload_kind = "agent_turn"
+    payload_command = ""
+    payload_message = message
+    if command:
+        payload_kind = "exec"
+        payload_command = command.strip()
+        payload_message = message or f"RUN:{payload_command}"
+        if not payload_command:
+            console.print("[red]Error: --command cannot be empty[/red]")
+            raise typer.Exit(1)
+    elif not payload_message.strip():
+        console.print("[red]Error: Must provide --message when --command is not set[/red]")
+        raise typer.Exit(1)
     
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -862,7 +957,10 @@ def cron_add(
     job = service.add_job(
         name=name,
         schedule=schedule,
-        message=message,
+        message=payload_message,
+        kind=payload_kind,
+        command=payload_command,
+        timeout_s=timeout,
         deliver=deliver,
         to=to,
         channel=channel,
