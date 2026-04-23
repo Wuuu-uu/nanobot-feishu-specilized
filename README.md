@@ -78,6 +78,8 @@ An image generation tool using OpenAI-compatible endpoints, with optional direct
 - **Text-to-image**: Generate images from a text prompt
 - **Image editing**: Accept single or multiple input images for editing tasks
 - **Aspect ratio control**: Supports `1:1`, `16:9`, `original`, etc.
+- **Images API opt-in**: Set `images_port_enabled` for `gpt-image-*` models to use `/images/generations` and `/images/edits`
+- **Quality-based size derivation**: Set `quality_enabled` to expose `quality` and derive a valid `size` from quality + aspect ratio
 - **Feishu integration**: Optionally upload and send the generated image to Feishu directly
 - Configured via `tools.image_gen` in `config.json`
 
@@ -360,6 +362,8 @@ The `message` tool supports two message categories:
       "api_base": "https://your-api.com/v1",
       "api_key": "your-key",
       "model_name": "gemini-3-pro-image-preview",
+      "images_port_enabled": false,
+      "quality_enabled": false,
       "timeout": 120,
       "retry_attempts": 3
     },
@@ -431,9 +435,11 @@ The `message` tool supports two message categories:
 | `nanobot agent` | Interactive chat mode |
 | `nanobot gateway` | Start the gateway (Feishu bot + cron service) |
 | `nanobot status` | Show current status |
-| `nanobot cron add` | Add a scheduled task |
+| `nanobot cron add` | Add a scheduled task (`--message` or deterministic `--command`) |
 | `nanobot cron list` | List scheduled tasks |
 | `nanobot cron remove <id>` | Remove a scheduled task |
+| `nanobot cron enable <id>` | Enable or disable a scheduled task |
+| `nanobot cron run <id>` | Run a scheduled task immediately |
 
 ---
 

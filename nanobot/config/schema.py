@@ -143,6 +143,8 @@ class ImageGenConfig(BaseModel):
     api_base: str = ""
     api_key: str = ""
     model_name: str = ""
+    images_port_enabled: bool = False
+    quality_enabled: bool = False
     timeout: int = 120
     retry_attempts: int = 3
     retry_backoff_seconds: float = 1.0

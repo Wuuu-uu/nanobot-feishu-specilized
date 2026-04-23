@@ -31,6 +31,20 @@ except ImportError:
 	lark = None
 
 
+_ORIGINAL_ASPECT_RATIOS = {"", "original", "原比例", "auto"}
+_QUALITY_LONG_EDGES = {
+	"low": 1024,
+	"medium": 1536,
+	"high": 2048,
+	"auto": 1536,
+}
+_IMAGE_SIZE_MULTIPLE = 16
+_IMAGE_MIN_PIXELS = 655_360
+_IMAGE_MAX_PIXELS = 8_294_400
+_IMAGE_MAX_EDGE = 3840
+_IMAGE_MAX_RATIO = 3.0
+
+
 class ImageGenerateTool(Tool):
 	"""Generate images via a model API and optionally send via Feishu."""
 
@@ -63,49 +77,59 @@ class ImageGenerateTool(Tool):
 
 	@property
 	def parameters(self) -> dict[str, Any]:
+		properties: dict[str, Any] = {
+			"prompt": {
+				"type": "string",
+				"description": "Image generation prompt",
+			},
+			"image_path": {
+				"type": "string",
+				"description": "Optional single image path for editing",
+			},
+			"image_paths": {
+				"type": "array",
+				"description": "Optional list of image paths for editing",
+				"items": {"type": "string"},
+			},
+			"aspect_ratio": {
+				"type": "string",
+				"description": "Aspect ratio like 'original', '1:1', '16:9', or '9:16'",
+				"default": "original",
+			},
+			"output_path": {
+				"type": "string",
+				"description": "Optional file path to save the image",
+			},
+			"send_to_user": {
+				"type": "boolean",
+				"description": "Send image to user via Feishu",
+				"default": False,
+			},
+			"title": {
+				"type": "string",
+				"description": "Optional Feishu post title for image message",
+			},
+			"channel": {
+				"type": "string",
+				"description": "Optional target channel override",
+			},
+			"chat_id": {
+				"type": "string",
+				"description": "Optional target chat/user ID override",
+			},
+		}
+		if self.config.images_port_enabled and self.config.quality_enabled:
+			properties["quality"] = {
+				"type": "string",
+				"description": (
+					"Optional quality tier used to derive Images API size when aspect_ratio "
+					"is explicit; not forwarded as a quality parameter"
+				),
+				"enum": ["low", "medium", "high", "auto"],
+			}
 		return {
 			"type": "object",
-			"properties": {
-				"prompt": {
-					"type": "string",
-					"description": "Image generation prompt",
-				},
-				"image_path": {
-					"type": "string",
-					"description": "Optional single image path for editing",
-				},
-				"image_paths": {
-					"type": "array",
-					"description": "Optional list of image paths for editing",
-					"items": {"type": "string"},
-				},
-				"aspect_ratio": {
-					"type": "string",
-					"description": "Aspect ratio like '1:1', '16:9', or 'original'",
-					"default": "1:1",
-				},
-				"output_path": {
-					"type": "string",
-					"description": "Optional file path to save the image",
-				},
-				"send_to_user": {
-					"type": "boolean",
-					"description": "Send image to user via Feishu",
-					"default": False,
-				},
-				"title": {
-					"type": "string",
-					"description": "Optional Feishu post title for image message",
-				},
-				"channel": {
-					"type": "string",
-					"description": "Optional target channel override",
-				},
-				"chat_id": {
-					"type": "string",
-					"description": "Optional target chat/user ID override",
-				},
-			},
+			"properties": properties,
 			"required": ["prompt"],
 		}
 
@@ -114,7 +138,8 @@ class ImageGenerateTool(Tool):
 		prompt: str,
 		image_path: str | None = None,
 		image_paths: list[str] | None = None,
-		aspect_ratio: str = "1:1",
+		aspect_ratio: str = "original",
+		quality: str | None = None,
 		output_path: str | None = None,
 		send_to_user: bool = False,
 		title: str | None = None,
@@ -128,11 +153,16 @@ class ImageGenerateTool(Tool):
 			return "Error: image generation config missing api_base/api_key/model_name."
 
 		images = self._collect_images(image_path, image_paths)
-		effective_ratio = self._resolve_aspect_ratio(aspect_ratio, images)
+		effective_ratio = self._resolve_aspect_ratio(str(kwargs.get("ratio") or aspect_ratio), images)
 		full_prompt = self._build_prompt(prompt, effective_ratio)
 
 		try:
-			img_bytes, mime_type = await self._generate_image(full_prompt, images)
+			img_bytes, mime_type = await self._generate_image(
+				full_prompt,
+				images,
+				effective_ratio,
+				quality,
+			)
 		except Exception as e:
 			msg = str(e) or type(e).__name__
 			return f"Error: image generation failed: {msg}"
@@ -186,20 +216,152 @@ class ImageGenerateTool(Tool):
 		self,
 		full_prompt: str,
 		images: list[dict[str, Any]] | None = None,
+		aspect_ratio: str = "original",
+		quality: str | None = None,
+	) -> tuple[bytes, str]:
+		if self._should_use_images_api():
+			return await self._generate_image_via_images_api(
+				full_prompt,
+				images or [],
+				aspect_ratio,
+				quality,
+			)
+		return await self._generate_image_via_chat_completions(full_prompt, images or [])
+
+	def _should_use_images_api(self) -> bool:
+		model_name = (self.config.model_name or "").strip().lower()
+		return self.config.images_port_enabled and model_name.startswith("gpt-image")
+
+	async def _generate_image_via_chat_completions(
+		self,
+		full_prompt: str,
+		images: list[dict[str, Any]],
 	) -> tuple[bytes, str]:
 		url = urljoin(self.config.api_base.rstrip("/") + "/", "chat/completions")
 		user_content: list[dict[str, Any]] = [{"type": "text", "text": full_prompt}]
 		if images:
-			user_content.extend(images)
+			user_content.extend(
+				{"type": "image_url", "image_url": image["image_url"]}
+				for image in images
+			)
 		payload = {
 			"model": self.config.model_name,
 			"messages": [{"role": "user", "content": user_content}],
 			"stream": False,
 		}
-		headers = {
-			"Authorization": f"Bearer {self.config.api_key}",
+		headers = self._json_headers()
+
+		response = await self._post_with_retries(
+			url,
+			json_payload=payload,
+			headers=headers,
+		)
+		data = response.json()
+		image_match = _extract_image_from_payload(data)
+		if not image_match:
+			detail = _describe_payload(data)
+			raise RuntimeError(f"no base64 image data found in response ({detail})")
+
+		mime_type, b64_data = image_match
+		img_bytes = base64.b64decode(b64_data)
+		return img_bytes, mime_type
+
+	async def _generate_image_via_images_api(
+		self,
+		full_prompt: str,
+		images: list[dict[str, Any]],
+		aspect_ratio: str,
+		quality: str | None,
+	) -> tuple[bytes, str]:
+		size = self._resolve_images_api_size(aspect_ratio, quality)
+		if images:
+			url = urljoin(self.config.api_base.rstrip("/") + "/", "images/edits")
+			form_data: dict[str, Any] = {
+				"model": self.config.model_name,
+				"prompt": full_prompt,
+			}
+			if size:
+				form_data["size"] = size
+			response = await self._post_with_retries(
+				url,
+				data_payload=form_data,
+				files=self._build_images_api_files(images),
+				headers=self._auth_headers(),
+			)
+		else:
+			url = urljoin(self.config.api_base.rstrip("/") + "/", "images/generations")
+			payload: dict[str, Any] = {
+				"model": self.config.model_name,
+				"prompt": full_prompt,
+			}
+			if size:
+				payload["size"] = size
+			response = await self._post_with_retries(
+				url,
+				json_payload=payload,
+				headers=self._json_headers(),
+			)
+
+		data = response.json()
+		image_match = _extract_image_from_payload(data)
+		if not image_match:
+			detail = _describe_payload(data)
+			raise RuntimeError(f"no base64 image data found in response ({detail})")
+
+		mime_type, b64_data = image_match
+		img_bytes = base64.b64decode(b64_data)
+		return img_bytes, mime_type
+
+	def _resolve_images_api_size(self, aspect_ratio: str, quality: str | None) -> str | None:
+		if not self.config.quality_enabled or not quality:
+			return None
+		normalized_ratio = _normalize_aspect_ratio(aspect_ratio)
+		if _is_original_aspect_ratio(normalized_ratio):
+			return None
+		normalized_quality = quality.strip().lower()
+		if normalized_quality not in _QUALITY_LONG_EDGES:
+			raise ValueError(
+				"quality must be one of: low, medium, high, auto"
+			)
+		width_ratio, height_ratio = _parse_aspect_ratio(normalized_ratio)
+		return _derive_images_api_size(
+			width_ratio,
+			height_ratio,
+			_QUALITY_LONG_EDGES[normalized_quality],
+		)
+
+	def _build_images_api_files(
+		self,
+		images: list[dict[str, Any]],
+	) -> list[tuple[str, tuple[str, bytes, str]]]:
+		files: list[tuple[str, tuple[str, bytes, str]]] = []
+		for index, image in enumerate(images):
+			filename = str(image.get("filename") or f"image_{index + 1}.png")
+			mime_type = str(image.get("mime_type") or "image/png")
+			image_bytes = image.get("data")
+			if not isinstance(image_bytes, bytes):
+				raise ValueError(f"Invalid image data for {filename}")
+			files.append(("image[]", (filename, image_bytes, mime_type)))
+		return files
+
+	def _auth_headers(self) -> dict[str, str]:
+		return {"Authorization": f"Bearer {self.config.api_key}"}
+
+	def _json_headers(self) -> dict[str, str]:
+		return {
+			**self._auth_headers(),
 			"Content-Type": "application/json",
 		}
+
+	async def _post_with_retries(
+		self,
+		url: str,
+		*,
+		json_payload: dict[str, Any] | None = None,
+		data_payload: dict[str, Any] | None = None,
+		files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+		headers: dict[str, str] | None = None,
+	) -> httpx.Response:
 
 		max_attempts = max(1, self.config.retry_attempts)
 		retry_status_codes = set(self.config.retry_status_codes)
@@ -209,7 +371,13 @@ class ImageGenerateTool(Tool):
 		async with httpx.AsyncClient(timeout=self.config.timeout) as client:
 			for attempt in range(1, max_attempts + 1):
 				try:
-					response = await client.post(url, json=payload, headers=headers)
+					response = await client.post(
+						url,
+						json=json_payload,
+						data=data_payload,
+						files=files,
+						headers=headers,
+					)
 				except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
 					last_error = e
 					if attempt >= max_attempts:
@@ -250,15 +418,7 @@ class ImageGenerateTool(Tool):
 					raise RuntimeError(str(last_error)) from last_error
 				raise RuntimeError("request failed without response")
 
-		data = response.json()
-		image_match = _extract_image_from_payload(data)
-		if not image_match:
-			detail = _describe_payload(data)
-			raise RuntimeError(f"no base64 image data found in response ({detail})")
-
-		mime_type, b64_data = image_match
-		img_bytes = base64.b64decode(b64_data)
-		return img_bytes, mime_type
+		return response
 
 	def _save_image(self, img_bytes: bytes, mime_type: str, output_path: str | None) -> str:
 		extension = _mime_to_ext(mime_type)
@@ -294,18 +454,23 @@ class ImageGenerateTool(Tool):
 			mime = _guess_mime(path)
 			if not mime or not mime.startswith("image/"):
 				raise ValueError(f"Unsupported image type: {raw}")
-			b64_data = base64.b64encode(path.read_bytes()).decode("ascii")
+			image_bytes = path.read_bytes()
+			b64_data = base64.b64encode(image_bytes).decode("ascii")
 			images.append({
 				"type": "image_url",
 				"image_url": {"url": f"data:{mime};base64,{b64_data}"},
+				"filename": path.name,
+				"mime_type": mime,
+				"data": image_bytes,
 			})
 
 		return images
 
 	def _resolve_aspect_ratio(self, aspect_ratio: str, images: list[dict[str, Any]]) -> str:
-		if images and (not aspect_ratio or aspect_ratio == "1:1"):
+		normalized = _normalize_aspect_ratio(aspect_ratio)
+		if _is_original_aspect_ratio(normalized):
 			return "original"
-		return aspect_ratio or "1:1"
+		return normalized
 
 	def _upload_feishu_image(self, image_path: str) -> str:
 		if not FEISHU_AVAILABLE:
@@ -395,6 +560,24 @@ def _extract_content(payload: dict[str, Any]) -> str | list[dict[str, Any]]:
 
 def _extract_image_from_payload(payload: dict[str, Any]) -> tuple[str, str] | None:
 	try:
+		data_items = payload.get("data") or []
+		if data_items and isinstance(data_items, list):
+			first_item = data_items[0]
+			if isinstance(first_item, dict):
+				b64_json = first_item.get("b64_json")
+				if isinstance(b64_json, str) and b64_json:
+					output_format = str(first_item.get("output_format") or "png")
+					mime_type = output_format if "/" in output_format else f"image/{output_format}"
+					return mime_type, b64_json
+				url = first_item.get("url")
+				if isinstance(url, str):
+					match = _extract_image_data(url)
+					if match:
+						return match
+	except Exception:
+		return None
+
+	try:
 		choices = payload.get("choices") or []
 		if choices:
 			message = choices[0].get("message") or {}
@@ -421,6 +604,17 @@ def _extract_image_from_payload(payload: dict[str, Any]) -> tuple[str, str] | No
 
 
 def _describe_payload(payload: dict[str, Any]) -> str:
+	try:
+		data_items = payload.get("data") or []
+		if data_items and isinstance(data_items, list):
+			first_item = data_items[0]
+			if isinstance(first_item, dict):
+				keys = ",".join(sorted(first_item.keys()))
+				return f"data[0]=dict:{keys}"
+			return f"data[0]={type(first_item).__name__}"
+	except Exception:
+		return "payload=unreadable"
+
 	try:
 		choices = payload.get("choices") or []
 		if choices:
@@ -467,3 +661,98 @@ def _mime_to_ext(mime_type: str) -> str:
 def _guess_mime(path: Path) -> str:
 	mime, _ = mimetypes.guess_type(str(path))
 	return mime or ""
+
+
+def _normalize_aspect_ratio(aspect_ratio: str | None) -> str:
+	return (aspect_ratio or "original").strip().lower()
+
+
+def _is_original_aspect_ratio(aspect_ratio: str) -> bool:
+	return aspect_ratio in _ORIGINAL_ASPECT_RATIOS
+
+
+def _parse_aspect_ratio(aspect_ratio: str) -> tuple[float, float]:
+	match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*", aspect_ratio)
+	if not match:
+		raise ValueError("aspect_ratio must be 'original' or an explicit ratio like '16:9'")
+	width_ratio = float(match.group(1))
+	height_ratio = float(match.group(2))
+	if width_ratio <= 0 or height_ratio <= 0:
+		raise ValueError("aspect_ratio values must be positive")
+	ratio = max(width_ratio, height_ratio) / min(width_ratio, height_ratio)
+	if ratio > _IMAGE_MAX_RATIO:
+		raise ValueError("aspect_ratio long edge to short edge ratio must not exceed 3:1")
+	return width_ratio, height_ratio
+
+
+def _derive_images_api_size(width_ratio: float, height_ratio: float, target_long_edge: int) -> str:
+	if width_ratio >= height_ratio:
+		width = float(target_long_edge)
+		height = width * height_ratio / width_ratio
+	else:
+		height = float(target_long_edge)
+		width = height * width_ratio / height_ratio
+
+	width_px, height_px = _round_size_to_multiple(width, height)
+	width_px, height_px = _enforce_max_ratio(width_px, height_px)
+
+	pixels = width_px * height_px
+	if pixels < _IMAGE_MIN_PIXELS:
+		scale = (_IMAGE_MIN_PIXELS / pixels) ** 0.5
+		width_px, height_px = _ceil_size_to_multiple(width_px * scale, height_px * scale)
+		width_px, height_px = _enforce_max_ratio(width_px, height_px)
+
+	pixels = width_px * height_px
+	if max(width_px, height_px) > _IMAGE_MAX_EDGE or pixels > _IMAGE_MAX_PIXELS:
+		scale = min(
+			_IMAGE_MAX_EDGE / max(width_px, height_px),
+			(_IMAGE_MAX_PIXELS / pixels) ** 0.5,
+		)
+		width_px, height_px = _floor_size_to_multiple(width_px * scale, height_px * scale)
+		width_px, height_px = _enforce_max_ratio(width_px, height_px)
+
+	if width_px * height_px < _IMAGE_MIN_PIXELS or width_px * height_px > _IMAGE_MAX_PIXELS:
+		raise ValueError("derived image size is outside gpt-image-2 pixel constraints")
+	if max(width_px, height_px) > _IMAGE_MAX_EDGE:
+		raise ValueError("derived image size exceeds gpt-image-2 maximum edge length")
+	if max(width_px, height_px) / min(width_px, height_px) > _IMAGE_MAX_RATIO:
+		raise ValueError("derived image size exceeds gpt-image-2 ratio constraints")
+
+	return f"{width_px}x{height_px}"
+
+
+def _round_size_to_multiple(width: float, height: float) -> tuple[int, int]:
+	return (
+		max(_IMAGE_SIZE_MULTIPLE, round(width / _IMAGE_SIZE_MULTIPLE) * _IMAGE_SIZE_MULTIPLE),
+		max(_IMAGE_SIZE_MULTIPLE, round(height / _IMAGE_SIZE_MULTIPLE) * _IMAGE_SIZE_MULTIPLE),
+	)
+
+
+def _ceil_size_to_multiple(width: float, height: float) -> tuple[int, int]:
+	return (
+		max(_IMAGE_SIZE_MULTIPLE, _ceil_to_multiple(width)),
+		max(_IMAGE_SIZE_MULTIPLE, _ceil_to_multiple(height)),
+	)
+
+
+def _floor_size_to_multiple(width: float, height: float) -> tuple[int, int]:
+	return (
+		max(_IMAGE_SIZE_MULTIPLE, _floor_to_multiple(width)),
+		max(_IMAGE_SIZE_MULTIPLE, _floor_to_multiple(height)),
+	)
+
+
+def _ceil_to_multiple(value: float) -> int:
+	return int(-(-value // _IMAGE_SIZE_MULTIPLE) * _IMAGE_SIZE_MULTIPLE)
+
+
+def _floor_to_multiple(value: float) -> int:
+	return int(value // _IMAGE_SIZE_MULTIPLE) * _IMAGE_SIZE_MULTIPLE
+
+
+def _enforce_max_ratio(width: int, height: int) -> tuple[int, int]:
+	if width >= height and width / height > _IMAGE_MAX_RATIO:
+		height = _ceil_to_multiple(width / _IMAGE_MAX_RATIO)
+	if height > width and height / width > _IMAGE_MAX_RATIO:
+		width = _ceil_to_multiple(height / _IMAGE_MAX_RATIO)
+	return width, height
