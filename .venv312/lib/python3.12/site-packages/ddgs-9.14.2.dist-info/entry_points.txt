@@ -1,0 +1,2 @@
+[console_scripts]
+ddgs = ddgs.cli:safe_entry_point
