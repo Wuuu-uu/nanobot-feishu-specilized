@@ -85,6 +85,7 @@ nano.*.save
 # Environment & secrets (keep examples tracked if needed)
 .env.*
 !.env.example
+.venv312/
 
 # Logs & temp
 *.log

@@ -3,6 +3,7 @@
 import pytest
 
 from nanobot.agent.tools.filesystem import (
+    AppendFileTool,
     EditFileTool,
     ListDirTool,
     ReadFileTool,
@@ -91,6 +92,37 @@ class TestReadFileTool:
         result = await tool.execute(path=str(f))
         assert len(result) <= ReadFileTool._MAX_CHARS + 500  # small margin for footer
         assert "Use offset=" in result
+
+
+# ---------------------------------------------------------------------------
+# AppendFileTool
+# ---------------------------------------------------------------------------
+
+class TestAppendFileTool:
+
+    @pytest.fixture()
+    def tool(self, tmp_path):
+        return AppendFileTool(workspace=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_creates_and_appends_with_newline(self, tool, tmp_path):
+        path = tmp_path / "notes" / "log.txt"
+
+        created = await tool.execute(path=str(path), content="first")
+        appended = await tool.execute(path=str(path), content="second")
+
+        assert "Successfully appended" in created
+        assert "Successfully appended" in appended
+        assert path.read_text(encoding="utf-8") == "first\nsecond"
+
+    @pytest.mark.asyncio
+    async def test_can_refuse_to_create_missing_file(self, tool, tmp_path):
+        path = tmp_path / "missing.txt"
+
+        result = await tool.execute(path=str(path), content="x", create=False)
+
+        assert "File not found" in result
+        assert not path.exists()
 
 
 # ---------------------------------------------------------------------------

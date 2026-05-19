@@ -690,6 +690,74 @@ async def test_runner_replaces_empty_tool_result_with_marker():
 
 
 @pytest.mark.asyncio
+async def test_runner_projects_image_tool_result_as_user_visual_message():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    captured_second_call: list[dict] = []
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="I will inspect the image.",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_img",
+                        name="read_file",
+                        arguments={"path": "/tmp/photo.jpg"},
+                    )
+                ],
+                usage={},
+            )
+        captured_second_call[:] = messages
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value=[
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            "_meta": {"path": "/tmp/photo.jpg"},
+        },
+        {"type": "text", "text": "(Image file: /tmp/photo.jpg)"},
+    ])
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "describe photo"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
+    assert isinstance(tool_message["content"], str)
+    assert "[image: /tmp/photo.jpg]" in tool_message["content"]
+    assert "(Image file: /tmp/photo.jpg)" in tool_message["content"]
+
+    tool_idx = captured_second_call.index(tool_message)
+    visual_message = captured_second_call[tool_idx + 1]
+    assert visual_message["role"] == "user"
+    assert isinstance(visual_message["content"], list)
+    assert visual_message["content"][0]["type"] == "text"
+    assert (
+        "Visual content returned by tool `read_file`"
+        in visual_message["content"][0]["text"]
+    )
+    assert any(
+        block.get("type") == "image_url"
+        for block in visual_message["content"]
+        if isinstance(block, dict)
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_uses_raw_messages_when_context_governance_fails():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 

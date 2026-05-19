@@ -127,6 +127,11 @@ class CronService:
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
                             message=j["payload"].get("message", ""),
+                            command=j["payload"].get("command", ""),
+                            timeout_s=(
+                                j["payload"].get("timeoutS")
+                                or j["payload"].get("timeout_s")
+                            ),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
@@ -262,6 +267,8 @@ class CronService:
                     "payload": {
                         "kind": j.payload.kind,
                         "message": j.payload.message,
+                        "command": j.payload.command,
+                        "timeoutS": j.payload.timeout_s,
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
@@ -478,7 +485,10 @@ class CronService:
         self,
         name: str,
         schedule: CronSchedule,
-        message: str,
+        message: str = "",
+        kind: Literal["system_event", "agent_turn", "exec"] = "agent_turn",
+        command: str = "",
+        timeout_s: int | None = None,
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
@@ -488,6 +498,17 @@ class CronService:
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
+        normalized_message = message or ""
+        normalized_command = (command or "").strip()
+        if kind == "exec":
+            if not normalized_command and normalized_message.strip().startswith("RUN:"):
+                normalized_command = normalized_message.strip()[4:].strip()
+            if not normalized_command:
+                raise ValueError("command is required for exec cron jobs")
+        elif not normalized_message.strip() and kind != "system_event":
+            raise ValueError("message is required for non-exec cron jobs")
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError("timeout_s must be > 0")
         now = _now_ms()
 
         job = CronJob(
@@ -496,8 +517,10 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
-                message=message,
+                kind=kind,
+                message=normalized_message,
+                command=normalized_command,
+                timeout_s=timeout_s,
                 deliver=deliver,
                 channel=channel,
                 to=to,
@@ -585,6 +608,9 @@ class CronService:
         name: str | None = None,
         schedule: CronSchedule | None = None,
         message: str | None = None,
+        kind: Literal["agent_turn", "exec"] | None = None,
+        command: str | None = None,
+        timeout_s: int | None = None,
         deliver: bool | None = None,
         channel: str | None = ...,
         to: str | None = ...,
@@ -609,6 +635,14 @@ class CronService:
             job.name = name
         if message is not None:
             job.payload.message = message
+        if kind is not None:
+            job.payload.kind = kind
+        if command is not None:
+            job.payload.command = command
+        if timeout_s is not None:
+            if timeout_s <= 0:
+                raise ValueError("timeout_s must be > 0")
+            job.payload.timeout_s = timeout_s
         if deliver is not None:
             job.payload.deliver = deliver
         if channel is not ...:

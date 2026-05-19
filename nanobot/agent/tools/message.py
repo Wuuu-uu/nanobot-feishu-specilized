@@ -1,14 +1,17 @@
 """Message tool for sending messages to users."""
 
+import base64
+import mimetypes
 import os
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import OutboundMessage
-from nanobot.config.paths import get_workspace_path
+from nanobot.config.paths import get_media_dir, get_workspace_path
 
 
 @tool_parameters(
@@ -20,11 +23,21 @@ from nanobot.config.paths import get_workspace_path
             StringSchema(""),
             description="Optional: list of file paths to attach (images, video, audio, documents)",
         ),
+        image_path=StringSchema("Optional legacy single image path to attach"),
+        image_base64=StringSchema("Optional legacy base64 image data or data URI to attach"),
+        image_mime_type=StringSchema("Optional MIME type for image_base64 (default image/png)"),
+        file_path=StringSchema("Optional legacy single file path to attach"),
+        file_base64=StringSchema("Optional legacy base64 file data or data URI to attach"),
+        file_name=StringSchema("Optional filename for file_base64"),
+        file_mime_type=StringSchema(
+            "Optional MIME type for file_base64 (default application/octet-stream)"
+        ),
+        title=StringSchema("Optional title metadata for channels that support it"),
         buttons=ArraySchema(
             ArraySchema(StringSchema("Button label")),
             description="Optional: inline keyboard buttons as list of rows, each row is list of button labels.",
         ),
-        required=["content"],
+        required=[],
     )
 )
 class MessageTool(Tool):
@@ -108,16 +121,24 @@ class MessageTool(Tool):
 
     async def execute(
         self,
-        content: str,
+        content: str | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
         message_id: str | None = None,
         media: list[str] | None = None,
+        image_path: str | None = None,
+        image_base64: str | None = None,
+        image_mime_type: str | None = None,
+        file_path: str | None = None,
+        file_base64: str | None = None,
+        file_name: str | None = None,
+        file_mime_type: str | None = None,
+        title: str | None = None,
         buttons: list[list[str]] | None = None,
         **kwargs: Any
     ) -> str:
         from nanobot.utils.helpers import strip_think
-        content = strip_think(content)
+        content = strip_think(content or "")
 
         if buttons is not None:
             if not isinstance(buttons, list) or any(
@@ -146,18 +167,44 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
-        if media:
-            resolved = []
-            for p in media:
-                if p.startswith(("http://", "https://")) or os.path.isabs(p):
-                    resolved.append(p)
-                else:
-                    resolved.append(str(self._workspace / p))
-            media = resolved
+        media = list(media or [])
+        if image_path:
+            media.append(image_path)
+        if file_path:
+            media.append(file_path)
+        if image_base64:
+            try:
+                media.append(self._save_base64_media(image_base64, None, image_mime_type or "image/png"))
+            except Exception as e:
+                return f"Error: failed to save base64 image: {str(e)}"
+        if file_base64:
+            try:
+                media.append(
+                    self._save_base64_media(
+                        file_base64,
+                        file_name,
+                        file_mime_type or "application/octet-stream",
+                    )
+                )
+            except Exception as e:
+                return f"Error: failed to save base64 file: {str(e)}"
+
+        resolved = []
+        for p in media:
+            if p.startswith(("http://", "https://")) or os.path.isabs(p):
+                resolved.append(p)
+            else:
+                resolved.append(str(self._workspace / p))
+        media = resolved
+
+        if not content.strip() and not media:
+            return "Error: No content or media provided"
 
         metadata = dict(self._default_metadata.get()) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
+        if title:
+            metadata["title"] = title
         if self._record_channel_delivery_var.get():
             metadata["_record_channel_delivery"] = True
 
@@ -179,3 +226,33 @@ class MessageTool(Tool):
             return f"Message sent to {channel}:{chat_id}{media_info}{button_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+    @staticmethod
+    def _split_data_uri(data: str, mime_type: str) -> tuple[str, str]:
+        if not data.startswith("data:"):
+            return data, mime_type
+        header, b64 = data.split(",", 1)
+        if ";base64" in header:
+            detected = header.split(";", 1)[0].replace("data:", "")
+            if detected:
+                mime_type = detected
+        return b64, mime_type
+
+    def _save_base64_media(
+        self,
+        data: str,
+        file_name: str | None,
+        mime_type: str,
+    ) -> str:
+        b64, mime_type = self._split_data_uri(data, mime_type)
+        raw = base64.b64decode(b64)
+        extension = Path(file_name).suffix if file_name else ""
+        if not extension:
+            extension = mimetypes.guess_extension(mime_type) or ""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        safe_name = Path(file_name).name if file_name else f"outbound_{stamp}{extension}"
+        if not safe_name:
+            safe_name = f"outbound_{stamp}{extension}"
+        target = get_media_dir("outbound") / safe_name
+        target.write_bytes(raw)
+        return str(target)

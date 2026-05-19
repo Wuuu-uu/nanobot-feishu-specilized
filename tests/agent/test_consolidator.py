@@ -2,6 +2,8 @@
 
 import pytest
 import asyncio
+import json
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nanobot.agent.memory import (
@@ -251,6 +253,38 @@ class TestRawArchiveTruncation:
         store.raw_archive(messages, max_chars=100)
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries[0]["content"]) < 200
+
+    def test_raw_archive_cold_archives_old_messages_outside_dream_history(self, store):
+        old_ts = (datetime.now() - timedelta(days=60)).isoformat()
+        recent_ts = datetime.now().isoformat()
+        messages = [
+            {"role": "user", "content": "old task", "timestamp": old_ts},
+            {"role": "user", "content": "recent task", "timestamp": recent_ts},
+        ]
+
+        store.raw_archive(messages)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert "recent task" in entries[0]["content"]
+        assert "old task" not in entries[0]["content"]
+
+        archive_files = list((store.memory_dir / "archive" / "session-raw").glob("*.jsonl"))
+        assert len(archive_files) == 1
+        cold_record = json.loads(archive_files[0].read_text(encoding="utf-8").splitlines()[0])
+        assert cold_record["message_count"] == 1
+        assert "old task" in cold_record["content"]
+
+    def test_raw_archive_cold_archive_can_be_disabled(self, store):
+        old_ts = (datetime.now() - timedelta(days=60)).isoformat()
+        store.cold_archive_older_than_days = 0
+
+        store.raw_archive([{"role": "user", "content": "old but included", "timestamp": old_ts}])
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert "old but included" in entries[0]["content"]
+        assert not (store.memory_dir / "archive" / "session-raw").exists()
 
 
 class TestArchiveTruncation:

@@ -18,6 +18,7 @@ from nanobot.utils.helpers import (
     find_legal_message_start,
     image_placeholder_text,
     safe_filename,
+    truncate_string,
 )
 
 FILE_MAX_MESSAGES = 2000
@@ -248,6 +249,28 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._active_path = self.sessions_dir / "_active.json"
+        self._active_map = self._load_active_map()
+
+    def _load_active_map(self) -> dict[str, str]:
+        if not self._active_path.exists():
+            return {}
+        try:
+            data = json.loads(self._active_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            logger.warning("Failed to load active sessions map: {}", e)
+        return {}
+
+    def _save_active_map(self) -> None:
+        try:
+            self._active_path.write_text(
+                json.dumps(self._active_map, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Failed to save active sessions map: {}", e)
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -261,6 +284,32 @@ class SessionManager:
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"
+
+    def session_exists(self, key: str) -> bool:
+        """Return whether a session exists on disk or in the in-memory cache."""
+        return key in self._cache or self._get_session_path(key).exists()
+
+    def get_active_session_key(self, channel: str, chat_id: str) -> str | None:
+        """Get active session override for a channel/chat pair, if set."""
+        map_key = f"{channel}:{chat_id}"
+        session_key = self._active_map.get(map_key)
+        if session_key and not self.session_exists(session_key):
+            self._active_map.pop(map_key, None)
+            self._save_active_map()
+            return None
+        return session_key
+
+    def set_active_session_key(self, channel: str, chat_id: str, session_key: str) -> None:
+        """Set active session override for a channel/chat pair."""
+        self._active_map[f"{channel}:{chat_id}"] = session_key
+        self._save_active_map()
+
+    def clear_active_session_key(self, channel: str, chat_id: str) -> None:
+        """Clear active session override for a channel/chat pair."""
+        map_key = f"{channel}:{chat_id}"
+        if map_key in self._active_map:
+            self._active_map.pop(map_key, None)
+            self._save_active_map()
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -413,6 +462,10 @@ class SessionManager:
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
 
+        if "title" not in session.metadata:
+            session.metadata["title"] = self._derive_title_from_messages(session)
+        session.metadata.setdefault("key", session.key)
+
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
@@ -549,6 +602,7 @@ class SessionManager:
                             key = data.get("key") or path.stem.replace("_", ":", 1)
                             sessions.append({
                                 "key": key,
+                                "title": self.get_session_title(key) or "",
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "path": str(path)
@@ -558,6 +612,7 @@ class SessionManager:
                 if repaired is not None:
                     sessions.append({
                         "key": repaired.key,
+                        "title": repaired.metadata.get("title") or self._derive_title_from_messages(repaired),
                         "created_at": repaired.created_at.isoformat(),
                         "updated_at": repaired.updated_at.isoformat(),
                         "path": str(path)
@@ -565,3 +620,51 @@ class SessionManager:
                 continue
 
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def get_session_title(self, key: str) -> str | None:
+        """Get a session title from cache, metadata, or the first user message."""
+        session = self._cache.get(key)
+        if session and session.metadata.get("title"):
+            return str(session.metadata["title"])
+        path = self._get_session_path(key)
+        if not path.exists():
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    data = json.loads(first_line)
+                    if data.get("_type") == "metadata":
+                        meta = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+                        if meta.get("title"):
+                            return str(meta["title"])
+        except Exception:
+            return None
+        return self._infer_title_from_file(path)
+
+    @staticmethod
+    def _derive_title_from_messages(session: Session) -> str:
+        for msg in session.messages:
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                text = msg.get("content", "").strip()
+                if text:
+                    return truncate_string(text.splitlines()[0], max_len=60)
+        stamp = session.created_at.strftime("%Y-%m-%d %H:%M")
+        return f"Session {stamp}"
+
+    def _infer_title_from_file(self, path: Path) -> str:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _ = f.readline()
+                for _ in range(50):
+                    line = f.readline()
+                    if not line:
+                        break
+                    data = json.loads(line)
+                    if data.get("role") == "user" and isinstance(data.get("content"), str):
+                        text = data.get("content", "").strip()
+                        if text:
+                            return truncate_string(text.splitlines()[0], max_len=60)
+        except Exception:
+            pass
+        return ""

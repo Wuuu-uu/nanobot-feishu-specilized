@@ -46,6 +46,11 @@ class DreamConfig(Base):
     max_batch_size: int = Field(default=20, ge=1)  # Max history entries per run
     # Bumped from 10 to 15 in #3212 (exp002: +30% dedup, no accuracy loss; >15 plateaus).
     max_iterations: int = Field(default=15, ge=1)  # Max tool calls per Phase 2
+    cold_archive_older_than_days: int = Field(
+        default=30,
+        ge=0,
+    )  # Raw session messages older than this go to cold archive instead of Dream history (0 = disabled)
+    allow_topic_edits: bool = True  # Allow Dream to inspect/edit memory/topics/*.md project notes
     # Per-line git-blame age annotation in Phase 1 prompt (see #3212). Default
     # on — set to False to feed MEMORY.md raw if a specific LLM reacts poorly
     # to the `← Nd` suffix or you want deterministic, git-independent prompts.
@@ -94,6 +99,10 @@ class AgentDefaults(Base):
         default=120,
         ge=0,
     )  # Max messages to replay from session history (0 = use default 120, respects token budget)
+    session_archive_buffer_messages: int = Field(
+        default=80,
+        ge=0,
+    )  # Extra recent messages retained on disk beyond maxMessages before raw archive/cold archive
     consolidation_ratio: float = Field(
         default=0.5,
         ge=0.1,
@@ -187,12 +196,114 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class CloudinaryConfig(Base):
+    """Cloudinary image hosting configuration used by the Notion tool."""
+
+    cloud_name: str = ""
+    api_key: str = ""
+    api_secret: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cloud_name and self.api_key and self.api_secret)
+
+
+class NotionToolConfig(Base):
+    """Notion ingestion/management tool configuration."""
+
+    enabled: bool = False
+    api_key: str = ""
+    database_id: str = ""
+    type_database_map: dict[str, str] = Field(default_factory=dict)
+    notion_version: str = "2022-06-28"
+    timeout: int = 30
+    title_property: str = "Name"
+    type_property: str = "Type"
+    source_path_property: str = "Source Path"
+    file_name_property: str = "File Name"
+    content_property: str = "Content"
+    max_content_chars: int = 4000
+    cloudinary: CloudinaryConfig = Field(default_factory=CloudinaryConfig)
+
+
+class ImageGenConfig(Base):
+    """Image generation/editing tool configuration."""
+
+    enabled: bool = False
+    api_base: str = ""
+    api_key: str = ""
+    model_name: str = ""
+    images_port_enabled: bool = False
+    quality_enabled: bool = False
+    timeout: int = 120
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
+    retry_backoff_multiplier: float = 2.0
+    retry_max_backoff_seconds: float = 8.0
+    retry_status_codes: list[int] = Field(
+        default_factory=lambda: [408, 409, 425, 429, 500, 502, 503, 504]
+    )
+
+
+class MineruConfig(Base):
+    """MinerU KIE PDF/document parsing tool configuration."""
+
+    enabled: bool = False
+    api_url: str = "https://mineru.net/api/v4/extract/task"
+    token: str = ""
+    model_version: str = "vlm"
+    timeout: int = 100
+    poll_interval: int = 5
+    output_dir: str = ""
+
+
+class RetrievalWeightsConfig(Base):
+    """Ranking weights for SQLite personal memory retrieval."""
+
+    keyword: float = 2.0
+    tag: float = 1.5
+    summary: float = 1.5
+    content: float = 1.0
+    priority: float = 0.15
+    recency: float = 0.3
+    kind: float = 0.5
+    scope: float = 0.5
+
+
+class MemorySystemConfig(Base):
+    """Optional SQLite personal memory search configuration."""
+
+    enabled: bool = False
+    db_path: str = Field(
+        default_factory=lambda: str(
+            Path.home() / ".nanobot" / "workspace" / "memory" / "personal_memory.db"
+        )
+    )
+    default_user_id: str = "shared"
+    retrieval_top_k: int = 5
+    fallback_top_k: int = 2
+    core_memory_max_items: int = 8
+    max_candidates_per_run: int = 3
+    max_related_memories: int = 5
+    summary_max_chars: int = 220
+    llm_model: str | None = None
+    update_memory_md: bool = False
+    retrieval_weights: RetrievalWeightsConfig = Field(default_factory=RetrievalWeightsConfig)
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    provider: str = "duckduckgo"  # brave, tavily, duckduckgo, searxng, jina, kagi, olostep
+    provider: str = "duckduckgo"  # brave, tavily, duckduckgo, searxng, jina, kagi, olostep, serper
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
+    endpoint: str = "https://google.serper.dev/search"  # Serper endpoint
+    country: str | None = None  # Serper gl
+    language: str | None = None  # Serper hl
+    tbs: str | None = None  # Serper date range filter
+    page: int | None = None
+    autocorrect: bool | None = None
+    search_type: str | None = None
     max_results: int = 5
     timeout: int = 30  # Wall-clock timeout (seconds) for search operations
 
@@ -251,6 +362,10 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     my: MyToolConfig = Field(default_factory=MyToolConfig)
+    notion: NotionToolConfig = Field(default_factory=NotionToolConfig)
+    image_gen: ImageGenConfig = Field(default_factory=ImageGenConfig)
+    mineru: MineruConfig = Field(default_factory=MineruConfig)
+    memory_system: MemorySystemConfig = Field(default_factory=MemorySystemConfig)
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)

@@ -346,6 +346,53 @@ async def test_direct_openai_reasoning_prefers_responses_api() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_proxy_reasoning_with_tools_uses_responses_api() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(return_value=_fake_responses_response("reasoned"))
+    spec = find_by_name("openai")
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }]
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        client_instance = MockClient.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            api_base="https://yeysai.com/v1/",
+            default_model="gpt-5.5-2026-04-24",
+            spec=spec,
+        )
+        result = await provider.chat(
+            messages=[{"role": "user", "content": "search"}],
+            tools=tools,
+            model="gpt-5.5-2026-04-24",
+            reasoning_effort="high",
+        )
+
+    assert result.content == "reasoned"
+    mock_responses.assert_awaited_once()
+    mock_chat.assert_not_awaited()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["model"] == "gpt-5.5-2026-04-24"
+    assert call_kwargs["reasoning"] == {"effort": "high"}
+    assert call_kwargs["tools"][0]["name"] == "web_search"
+    assert "messages" not in call_kwargs
+    assert "reasoning_effort" not in call_kwargs
+
+
+@pytest.mark.asyncio
 async def test_direct_openai_gpt4o_stays_on_chat_completions() -> None:
     mock_chat = AsyncMock(return_value=_fake_chat_response())
     mock_responses = AsyncMock(return_value=_fake_responses_response())

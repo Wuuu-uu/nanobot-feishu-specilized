@@ -15,15 +15,19 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
 _CRON_PARAMETERS = tool_parameters_schema(
-    action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
+    action=StringSchema("Action to perform", enum=["add", "list", "remove", "enable", "run"]),
     name=StringSchema(
         "Optional short human-readable label for the job "
         "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
     ),
     message=StringSchema(
-        "REQUIRED when action='add'. Instruction for the agent to execute when the job triggers "
-        "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
-        "Not used for action='list' or action='remove'."
+        "REQUIRED when action='add' unless command is provided. Instruction for the agent "
+        "to execute when the job triggers (e.g., 'Send a reminder to WeChat: xxx' or "
+        "'Check system status and report'). Prefix with RUN: for deterministic exec jobs."
+    ),
+    command=StringSchema(
+        "Optional shell command for deterministic exec cron jobs when action='add'. "
+        "Executed through nanobot's exec tool policy when the job fires."
     ),
     every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
@@ -35,15 +39,31 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
         "Naive values use the tool's default timezone."
     ),
-    deliver=BooleanSchema(
-        description="Whether to deliver the execution result to the user channel (default true)",
-        default=True,
+    at_time=StringSchema("Legacy alias for at."),
+    timeout_seconds=IntegerSchema(
+        0,
+        description="Optional timeout in seconds for command/RUN cron jobs",
+        minimum=1,
+        maximum=600,
     ),
-    job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    deliver=BooleanSchema(
+        description=(
+            "Whether to deliver the execution result to the user channel. "
+            "When omitted, message jobs deliver by default and command/RUN jobs do not."
+        ),
+        nullable=True,
+    ),
+    enabled=BooleanSchema(description="Whether to enable or disable a job for action='enable'."),
+    force=BooleanSchema(description="Run a disabled job anyway for action='run'.", default=False),
+    include_disabled=BooleanSchema(
+        description="Include disabled jobs when action='list'.",
+        default=False,
+    ),
+    job_id=StringSchema("REQUIRED when action='remove', 'enable', or 'run'. Job ID to operate on."),
     required=["action"],
     description=(
-        "Action-specific parameters: add requires a non-empty message plus one schedule "
-        "(every_seconds, cron_expr, or at); remove requires job_id; list only needs action. "
+        "Action-specific parameters: add requires a non-empty message or command plus one schedule "
+        "(every_seconds, cron_expr, or at); remove/enable/run require job_id; list only needs action. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
         "reject oneOf/anyOf/allOf/enum/not at the root of function parameters."
@@ -110,17 +130,19 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Schedule reminders and recurring tasks. Actions: add, list, remove, enable, run. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
     def validate_params(self, params: dict[str, Any]) -> list[str]:
         errors = super().validate_params(params)
         action = params.get("action")
-        if action == "add" and not str(params.get("message") or "").strip():
-            errors.append("message is required when action='add'")
-        if action == "remove" and not str(params.get("job_id") or "").strip():
-            errors.append("job_id is required when action='remove'")
+        command = str(params.get("command") or "").strip()
+        message = str(params.get("message") or "").strip()
+        if action == "add" and not command and not message:
+            errors.append("message or command is required when action='add'")
+        if action in {"remove", "enable", "run"} and not str(params.get("job_id") or "").strip():
+            errors.append(f"job_id is required when action='{action}'")
         return errors
 
     async def execute(
@@ -132,18 +154,38 @@ class CronTool(Tool):
         cron_expr: str | None = None,
         tz: str | None = None,
         at: str | None = None,
+        at_time: str | None = None,
+        command: str = "",
+        timeout_seconds: int | None = None,
         job_id: str | None = None,
-        deliver: bool = True,
+        deliver: bool | None = None,
+        enabled: bool = True,
+        force: bool = False,
+        include_disabled: bool = False,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(
+                name,
+                message,
+                every_seconds,
+                cron_expr,
+                tz,
+                at or at_time,
+                deliver,
+                command=command,
+                timeout_seconds=timeout_seconds,
+            )
         elif action == "list":
-            return self._list_jobs()
+            return self._list_jobs(include_disabled=include_disabled)
         elif action == "remove":
             return self._remove_job(job_id)
+        elif action == "enable":
+            return self._enable_job(job_id, enabled)
+        elif action == "run":
+            return await self._run_job(job_id, force)
         return f"Unknown action: {action}"
 
     def _add_job(
@@ -154,14 +196,34 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
-        deliver: bool = True,
+        deliver: bool | None = None,
+        *,
+        command: str = "",
+        timeout_seconds: int | None = None,
     ) -> str:
-        if not message:
+        normalized_message = (message or "").strip()
+        normalized_command = (command or "").strip()
+        payload_kind = "agent_turn"
+        payload_command = ""
+        payload_message = message or ""
+        if normalized_command:
+            payload_kind = "exec"
+            payload_command = normalized_command
+            payload_message = payload_message or f"RUN:{payload_command}"
+        elif normalized_message.startswith("RUN:"):
+            payload_command = normalized_message[4:].strip()
+            if not payload_command:
+                return "Error: RUN: command is empty"
+            payload_kind = "exec"
+        elif not normalized_message:
             return (
                 "Error: cron action='add' requires a non-empty 'message' parameter "
-                "describing what to do when the job triggers "
+                "or a non-empty 'command' parameter describing what to do when the job triggers "
                 "(e.g. the reminder text). Retry including message=\"...\"."
             )
+        should_deliver = payload_kind != "exec" if deliver is None else bool(deliver)
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            return "Error: timeout_seconds must be > 0"
         channel = self._channel.get()
         chat_id = self._chat_id.get()
         if not channel or not chat_id:
@@ -199,10 +261,13 @@ class CronTool(Tool):
             return "Error: either every_seconds, cron_expr, or at is required"
 
         job = self._cron.add_job(
-            name=name or message[:30],
+            name=name or payload_message[:30] or f"RUN:{payload_command}"[:30],
             schedule=schedule,
-            message=message,
-            deliver=deliver,
+            message=payload_message,
+            kind=payload_kind,
+            command=payload_command,
+            timeout_s=timeout_seconds,
+            deliver=should_deliver,
             channel=channel,
             to=chat_id,
             delete_after_run=delete_after,
@@ -251,17 +316,23 @@ class CronTool(Tool):
             return "Dream memory consolidation for long-term memory."
         return "System-managed internal job."
 
-    def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
+    def _list_jobs(self, include_disabled: bool = False) -> str:
+        jobs = self._cron.list_jobs(include_disabled=include_disabled)
         if not jobs:
             return "No scheduled jobs."
         lines = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
-            parts = [f"- {j.name} (id: {j.id}, {timing})"]
+            state = "enabled" if j.enabled else "disabled"
+            suffix = f", {state}" if include_disabled else ""
+            parts = [f"- {j.name} (id: {j.id}, {timing}{suffix})"]
             if j.payload.kind == "system_event":
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
+            elif j.payload.kind == "exec":
+                parts.append("  Type: exec command")
+                if j.payload.deliver:
+                    parts.append("  Delivery: command result will be delivered")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
@@ -285,3 +356,19 @@ class CronTool(Tool):
                 "This is a protected system-managed cron job."
             )
         return f"Job {job_id} not found"
+
+    def _enable_job(self, job_id: str | None, enabled: bool) -> str:
+        if not job_id:
+            return "Error: job_id is required for enable"
+        job = self._cron.enable_job(job_id, enabled=enabled)
+        if not job:
+            return f"Job {job_id} not found"
+        return f"Job {job_id} {'enabled' if enabled else 'disabled'}"
+
+    async def _run_job(self, job_id: str | None, force: bool) -> str:
+        if not job_id:
+            return "Error: job_id is required for run"
+        ok = await self._cron.run_job(job_id, force=force)
+        if ok:
+            return f"Executed job {job_id}"
+        return f"Failed to run job {job_id}"

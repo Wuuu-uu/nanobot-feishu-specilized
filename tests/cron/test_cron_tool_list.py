@@ -364,10 +364,11 @@ def test_cron_schema_advertises_action_specific_requirements(tmp_path) -> None:
     assert "REQUIRED" in job_id_desc and "action='remove'" in job_id_desc
 
 
-def test_validate_params_requires_message_only_for_add(tmp_path) -> None:
+def test_validate_params_requires_message_or_command_only_for_add(tmp_path) -> None:
     tool = _make_tool(tmp_path)
 
-    assert "message is required when action='add'" in tool.validate_params({"action": "add"})
+    assert "message or command is required when action='add'" in tool.validate_params({"action": "add"})
+    assert tool.validate_params({"action": "add", "command": "echo ok"}) == []
     assert tool.validate_params({"action": "list"}) == []
     assert "job_id is required when action='remove'" in tool.validate_params({"action": "remove"})
 

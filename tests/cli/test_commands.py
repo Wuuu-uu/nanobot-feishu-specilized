@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import _heartbeat_route_from_session_key, _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.providers.factory import ProviderSnapshot
@@ -21,6 +21,81 @@ runner = CliRunner()
 
 class _StopGatewayError(RuntimeError):
     pass
+
+
+def test_heartbeat_route_strips_feishu_private_session_suffix() -> None:
+    route = _heartbeat_route_from_session_key(
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e:20260302-021352",
+        {"feishu"},
+    )
+
+    assert route == (
+        "feishu",
+        "ou_35201ab11bf7023133d04e7e85af735e",
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e:20260302-021352",
+    )
+
+
+def test_heartbeat_route_strips_feishu_group_thread_session_suffix() -> None:
+    route = _heartbeat_route_from_session_key(
+        "feishu:oc_abc123:om_root456",
+        {"feishu"},
+    )
+
+    assert route == (
+        "feishu",
+        "oc_abc123",
+        "feishu:oc_abc123:om_root456",
+    )
+
+
+def test_heartbeat_route_strips_feishu_private_underscore_suffix() -> None:
+    route = _heartbeat_route_from_session_key(
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e_tool-test",
+        {"feishu"},
+    )
+
+    assert route == (
+        "feishu",
+        "ou_35201ab11bf7023133d04e7e85af735e",
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e_tool-test",
+    )
+
+
+def test_heartbeat_route_strips_feishu_group_underscore_suffix() -> None:
+    route = _heartbeat_route_from_session_key(
+        "feishu:oc_35201ab11bf7023133d04e7e85af735e_some-session",
+        {"feishu"},
+    )
+
+    assert route == (
+        "feishu",
+        "oc_35201ab11bf7023133d04e7e85af735e",
+        "feishu:oc_35201ab11bf7023133d04e7e85af735e_some-session",
+    )
+
+
+def test_heartbeat_route_preserves_feishu_target_without_suffix() -> None:
+    route = _heartbeat_route_from_session_key(
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e",
+        {"feishu"},
+    )
+
+    assert route == (
+        "feishu",
+        "ou_35201ab11bf7023133d04e7e85af735e",
+        "feishu:ou_35201ab11bf7023133d04e7e85af735e",
+    )
+
+
+def test_heartbeat_route_rejects_invalid_feishu_target() -> None:
+    assert _heartbeat_route_from_session_key("feishu:not-a-receive-id:tail", {"feishu"}) is None
+
+
+def test_heartbeat_route_preserves_non_feishu_chat_id() -> None:
+    route = _heartbeat_route_from_session_key("dingtalk:group:conv123", {"dingtalk"})
+
+    assert route == ("dingtalk", "group:conv123", "dingtalk:group:conv123")
 
 
 @pytest.fixture

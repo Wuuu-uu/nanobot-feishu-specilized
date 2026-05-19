@@ -21,6 +21,7 @@ from nanobot.utils.helpers import (
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     find_legal_message_start,
+    image_placeholder_text,
     maybe_persist_tool_result,
     strip_think,
     truncate_text,
@@ -261,6 +262,7 @@ class AgentRunner:
                 # Snipping may have created new orphans; clean them up.
                 messages_for_model = self._drop_orphan_tool_results(messages_for_model)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+                messages_for_model = self._project_tool_images_as_user_messages(messages_for_model)
             except Exception as exc:
                 logger.warning(
                     "Context governance failed on turn {} for {}: {}; applying minimal repair",
@@ -271,6 +273,9 @@ class AgentRunner:
                 try:
                     messages_for_model = self._drop_orphan_tool_results(messages)
                     messages_for_model = self._backfill_missing_tool_results(messages_for_model)
+                    messages_for_model = self._project_tool_images_as_user_messages(
+                        messages_for_model
+                    )
                 except Exception:
                     messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
@@ -979,6 +984,86 @@ class AgentRunner:
         if isinstance(content, str) and len(content) > spec.max_tool_result_chars:
             return truncate_text(content, spec.max_tool_result_chars)
         return content
+
+    @staticmethod
+    def _is_image_block(value: Any) -> bool:
+        return isinstance(value, dict) and value.get("type") == "image_url"
+
+    @classmethod
+    def _tool_content_text_projection(cls, content: list[Any]) -> str:
+        parts: list[str] = []
+        for item in content:
+            if cls._is_image_block(item):
+                path = (item.get("_meta") or {}).get("path")
+                parts.append(image_placeholder_text(path, empty="[image omitted]"))
+                continue
+            if isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+                continue
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+                continue
+            try:
+                parts.append(json.dumps(item, ensure_ascii=False))
+            except TypeError:
+                parts.append(str(item))
+        return (
+            "\n".join(part for part in parts if part).strip()
+            or "[tool returned image content]"
+        )
+
+    @classmethod
+    def _project_tool_images_as_user_messages(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expose image tool outputs through a user multimodal message.
+
+        OpenAI-style tool result messages are text outputs; image blocks inside
+        ``role=tool`` are not treated as vision input by Chat Completions or
+        Responses gateways. Keep the tool result protocol text-only, then add a
+        user message carrying the visual blocks so providers can reuse their
+        normal user-image path.
+        """
+        projected: list[dict[str, Any]] | None = None
+
+        for idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if msg.get("role") != "tool" or not isinstance(content, list):
+                if projected is not None:
+                    projected.append(dict(msg))
+                continue
+            image_blocks = [item for item in content if cls._is_image_block(item)]
+            if not image_blocks:
+                if projected is not None:
+                    projected.append(dict(msg))
+                continue
+
+            if projected is None:
+                projected = [dict(item) for item in messages[:idx]]
+
+            tool_name = str(msg.get("name") or "tool")
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            tool_text = cls._tool_content_text_projection(content)
+            projected.append({**msg, "content": tool_text})
+
+            intro = (
+                f"Visual content returned by tool `{tool_name}`"
+                + (f" for call `{tool_call_id}`." if tool_call_id else ".")
+                + " Analyze the image content below as part of that tool result."
+            )
+            projected.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": intro},
+                    *[dict(item) for item in content],
+                ],
+            })
+
+        return projected if projected is not None else messages
 
     @staticmethod
     def _drop_orphan_tool_results(

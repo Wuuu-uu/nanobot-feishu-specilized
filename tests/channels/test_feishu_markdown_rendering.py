@@ -66,3 +66,22 @@ def test_split_headings_keeps_markdown_body_and_code_blocks_intact() -> None:
     assert elements[1]["tag"] == "markdown"
     assert "Body with **bold** text." in elements[1]["content"]
     assert "```python\nprint('hi')\n```" in elements[1]["content"]
+
+
+def test_normalize_card_markdown_lifts_indented_fenced_code_blocks() -> None:
+    content = (
+        "2. **Probe task**\n"
+        "   重点解决：\n"
+        "   ```text\n"
+        "   official image namespace\n"
+        "   instance branch\n"
+        "   ```\n"
+        "3. next\n"
+    )
+
+    normalized = FeishuChannel._normalize_card_markdown(content)
+
+    assert "   ```text" not in normalized
+    assert "```text\nofficial image namespace\ninstance branch\n```" in normalized
+    assert "2. **Probe task**" in normalized
+    assert "3. next" in normalized

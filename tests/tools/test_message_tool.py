@@ -1,3 +1,4 @@
+import base64
 import os
 
 import pytest
@@ -170,6 +171,58 @@ async def test_message_tool_passes_through_url_media_paths() -> None:
     )
 
     assert sent[0].media == [url]
+
+
+@pytest.mark.asyncio
+async def test_message_tool_allows_media_without_content() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(send_callback=_send)
+
+    result = await tool.execute(
+        channel="telegram",
+        chat_id="1",
+        image_path="/tmp/generated.png",
+        title="Generated image",
+    )
+
+    assert result == "Message sent to telegram:1 with 1 attachments"
+    assert sent[0].content == ""
+    assert sent[0].media == ["/tmp/generated.png"]
+    assert sent[0].metadata["title"] == "Generated image"
+
+
+@pytest.mark.asyncio
+async def test_message_tool_saves_base64_image_media(monkeypatch, tmp_path) -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    media_root = tmp_path / "media"
+    (media_root / "outbound").mkdir(parents=True)
+    monkeypatch.setattr(
+        "nanobot.agent.tools.message.get_media_dir",
+        lambda kind: media_root / kind,
+    )
+    tool = MessageTool(send_callback=_send)
+    image_b64 = base64.b64encode(b"png-bytes").decode("ascii")
+
+    result = await tool.execute(
+        channel="telegram",
+        chat_id="1",
+        image_base64=f"data:image/png;base64,{image_b64}",
+    )
+
+    assert result == "Message sent to telegram:1 with 1 attachments"
+    assert len(sent[0].media) == 1
+    saved = sent[0].media[0]
+    assert saved.startswith(str(media_root / "outbound"))
+    assert os.path.exists(saved)
+    assert open(saved, "rb").read() == b"png-bytes"
 
 
 @pytest.mark.asyncio

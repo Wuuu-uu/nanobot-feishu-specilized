@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import select
 import signal
 import sys
@@ -63,6 +64,32 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+_FEISHU_HEARTBEAT_TARGET_RE = re.compile(r"^(?P<target>o[cu]_[A-Za-z0-9]+)(?:[:_].*)?$")
+
+
+def _heartbeat_route_from_session_key(
+    key: str, enabled_channels: set[str]
+) -> tuple[str, str, str] | None:
+    """Return (channel, routable_chat_id, session_key) for heartbeat delivery."""
+    if ":" not in key:
+        return None
+    channel, chat_id = key.split(":", 1)
+    if channel in {"cli", "system"} or channel not in enabled_channels or not chat_id:
+        return None
+
+    # Feishu thread-scoped sessions are persisted as
+    # ``feishu:<chat/open_id>:<root/message/session>``. Only the first segment
+    # after the channel is a valid Feishu receive_id; the full key is still
+    # needed for context injection.
+    if channel == "feishu":
+        match = _FEISHU_HEARTBEAT_TARGET_RE.fullmatch(chat_id)
+        if match:
+            return channel, match.group("target"), key
+        return None
+
+    return channel, chat_id, key
+
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -552,6 +579,9 @@ def serve(
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
         max_messages=runtime_config.agents.defaults.max_messages,
+        session_archive_buffer_messages=runtime_config.agents.defaults.session_archive_buffer_messages,
+        dream_cold_archive_older_than_days=runtime_config.agents.defaults.dream.cold_archive_older_than_days,
+        dream_allow_topic_edits=runtime_config.agents.defaults.dream.allow_topic_edits,
         tools_config=runtime_config.tools,
     )
 
@@ -666,6 +696,9 @@ def _run_gateway(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         max_messages=config.agents.defaults.max_messages,
+        session_archive_buffer_messages=config.agents.defaults.session_archive_buffer_messages,
+        dream_cold_archive_older_than_days=config.agents.defaults.dream.cold_archive_older_than_days,
+        dream_allow_topic_edits=config.agents.defaults.dream.allow_topic_edits,
         tools_config=config.tools,
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
@@ -727,6 +760,34 @@ def _run_gateway(
             return None
 
         from nanobot.utils.evaluator import evaluate_response
+
+        if job.payload.kind == "exec":
+            exec_tool = agent.tools.get("exec")
+            if exec_tool is None:
+                response = "Error: exec tool is disabled; cannot run exec cron job"
+            else:
+                command = job.payload.command or ""
+                if not command and job.payload.message.strip().startswith("RUN:"):
+                    command = job.payload.message.strip()[4:].strip()
+                if not command:
+                    response = "Error: exec cron job has no command"
+                else:
+                    response = await exec_tool.execute(
+                        command=command,
+                        timeout=job.payload.timeout_s,
+                    )
+            if job.payload.deliver and job.payload.to and response:
+                await _deliver_to_channel(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=response,
+                        metadata=dict(job.payload.channel_meta),
+                    ),
+                    record=True,
+                    session_key=job.payload.session_key,
+                )
+            return response
 
         reminder_note = (
             "The scheduled time has arrived. Deliver this reminder to the user now, "
@@ -790,21 +851,17 @@ def _run_gateway(
     # can serve the embedded webui's REST surface).
     channels = ChannelManager(config, bus, session_manager=session_manager)
 
-    def _pick_heartbeat_target() -> tuple[str, str]:
+    def _pick_heartbeat_target() -> tuple[str, str, str | None]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
         # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
+            route = _heartbeat_route_from_session_key(key, enabled)
+            if route:
+                return route
         # Fallback keeps prior behavior but remains explicit.
-        return "cli", "direct"
+        return "cli", "direct", None
 
     # Create heartbeat service
     heartbeat_preamble = (
@@ -817,7 +874,7 @@ def _run_gateway(
 
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id, _session_key = _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -847,13 +904,14 @@ def _run_gateway(
         lands in a session that has no context about the heartbeat message
         and the agent cannot follow through.
         """
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id, session_key = _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
 
         await _deliver_to_channel(
             OutboundMessage(channel=channel, chat_id=chat_id, content=response),
             record=True,
+            session_key=session_key,
         )
 
     hb_cfg = config.gateway.heartbeat
@@ -923,11 +981,12 @@ def _run_gateway(
             await server.serve_forever()
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
-    if dream_cfg.model_override:
-        agent.dream.model = dream_cfg.model_override
+    agent.dream.set_model_override(dream_cfg.model_override)
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+    agent.dream.allow_topic_edits = dream_cfg.allow_topic_edits
+    agent.context.memory.cold_archive_older_than_days = dream_cfg.cold_archive_older_than_days
     from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
@@ -1057,6 +1116,9 @@ def agent(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         max_messages=config.agents.defaults.max_messages,
+        session_archive_buffer_messages=config.agents.defaults.session_archive_buffer_messages,
+        dream_cold_archive_older_than_days=config.agents.defaults.dream.cold_archive_older_than_days,
+        dream_allow_topic_edits=config.agents.defaults.dream.allow_topic_edits,
         tools_config=config.tools,
     )
     restart_notice = consume_restart_notice_from_env()

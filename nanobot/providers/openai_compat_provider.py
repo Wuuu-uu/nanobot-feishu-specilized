@@ -647,12 +647,19 @@ class OpenAICompatProvider(LLMProvider):
         model: str | None,
         reasoning_effort: str | None,
     ) -> bool:
-        """Use Responses API only for direct OpenAI requests that benefit from it."""
-        if self._spec and self._spec.name not in ("openai", "github_copilot"):
+        """Use Responses API for OpenAI-family requests that benefit from it.
+
+        ``provider: openai`` may point at a user-supplied OpenAI proxy via
+        apiBase. Treat that as OpenAI-family as well; generic compatibility
+        providers such as ``custom`` and OpenRouter stay on Chat Completions.
+        """
+        spec_name = self._spec.name if self._spec else None
+        if spec_name and spec_name not in ("openai", "github_copilot"):
             return False
-        if self._spec is None or self._spec.name != "github_copilot":
-            if not _is_direct_openai_base(self._effective_base):
-                return False
+        if spec_name not in ("openai", "github_copilot") and not _is_direct_openai_base(
+            self._effective_base
+        ):
+            return False
 
         model_name = (model or self.default_model).lower()
         wants = False
@@ -755,7 +762,29 @@ class OpenAICompatProvider(LLMProvider):
             body["tools"] = convert_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
 
+        configured_cache_key = self._extra_body.get("prompt_cache_key")
+        if isinstance(configured_cache_key, str) and configured_cache_key.strip():
+            body["prompt_cache_key"] = configured_cache_key.strip()
+        else:
+            body["prompt_cache_key"] = self._default_prompt_cache_key(model_name, instructions)
+
+        configured_retention = self._extra_body.get("prompt_cache_retention")
+        if configured_retention in {"in_memory", "24h"}:
+            body["prompt_cache_retention"] = configured_retention
+
         return body
+
+    @staticmethod
+    def _default_prompt_cache_key(model_name: str, instructions: str | None) -> str:
+        """Stable cache routing key for Responses API prompt caching.
+
+        The upstream cache also hashes the actual prompt prefix, so this key is
+        only a routing hint. Keep it stable across turns that share the same
+        static system prompt, and avoid including user-specific tail content.
+        """
+        model_hash = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:12]
+        prompt_hash = hashlib.sha256((instructions or "").encode("utf-8")).hexdigest()[:16]
+        return f"nanobot-{model_hash}-{prompt_hash}"
 
     # ------------------------------------------------------------------
     # Response parsing
@@ -1260,6 +1289,26 @@ class OpenAICompatProvider(LLMProvider):
                         # falling back to /chat/completions cannot succeed and would
                         # hide the real error.
                         raise
+                    if "Response failed:" in str(responses_error):
+                        logger.warning(
+                            "Streaming Responses API failed; retrying once with non-streaming Responses"
+                        )
+                        response = await self.chat(
+                            messages=messages,
+                            tools=tools,
+                            model=model,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            reasoning_effort=reasoning_effort,
+                            tool_choice=tool_choice,
+                        )
+                        if (
+                            on_content_delta
+                            and response.content
+                            and response.finish_reason != "error"
+                        ):
+                            await on_content_delta(response.content)
+                        return response
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)

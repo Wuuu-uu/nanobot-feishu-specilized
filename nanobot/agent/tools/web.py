@@ -14,7 +14,7 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
 from nanobot.utils.helpers import build_image_content_blocks
 
 if TYPE_CHECKING:
@@ -77,6 +77,12 @@ def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
     tool_parameters_schema(
         query=StringSchema("Search query"),
         count=IntegerSchema(1, description="Results (1-10)", minimum=1, maximum=10),
+        country=StringSchema("Optional Serper country code (gl), e.g. us or cn"),
+        language=StringSchema("Optional Serper language code (hl), e.g. en or zh-cn"),
+        tbs=StringSchema("Optional Serper date range filter, e.g. qdr:h, qdr:d, qdr:w"),
+        page=IntegerSchema(1, description="Optional Serper result page number", minimum=1),
+        autocorrect=BooleanSchema(description="Optional Serper autocorrect setting"),
+        searchType=StringSchema("Optional Serper search type, e.g. search, news, scholar"),
         required=["query"],
     )
 )
@@ -122,6 +128,9 @@ class WebSearchTool(Tool):
         if provider == "olostep":
             api_key = self.config.api_key or os.environ.get("OLOSTEP_API_KEY", "")
             return "olostep" if api_key else "duckduckgo"
+        if provider == "serper":
+            api_key = self.config.api_key or os.environ.get("SERPER_API_KEY", "")
+            return "serper" if api_key else "duckduckgo"
         return provider
 
     @property
@@ -151,8 +160,96 @@ class WebSearchTool(Tool):
             return await self._search_brave(query, n)
         elif provider == "kagi":
             return await self._search_kagi(query, n)
+        elif provider == "serper":
+            return await self._search_serper(query, n, **kwargs)
         else:
             return f"Error: unknown search provider '{provider}'"
+
+    def _serper_request_url(self, search_type: str | None) -> str:
+        endpoint = (self.config.endpoint or "https://google.serper.dev/search").strip()
+        normalized = (search_type or self.config.search_type or "search").strip().lower()
+        normalized = normalized.lstrip("/") or "search"
+        if normalized == "search":
+            return endpoint
+        parsed = urlparse(endpoint)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/{normalized}"
+        return endpoint
+
+    @staticmethod
+    def _serper_results(data: dict[str, Any], search_type: str | None) -> list[dict[str, Any]]:
+        normalized = (search_type or "search").strip().lower().lstrip("/")
+        if normalized == "news":
+            raw_items = data.get("news") or data.get("topStories") or []
+        else:
+            raw_items = data.get("organic") or []
+        items: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            items.append({
+                "title": item.get("title", ""),
+                "url": item.get("link") or item.get("url", ""),
+                "content": item.get("snippet") or item.get("description") or "",
+            })
+        return items
+
+    async def _search_serper(self, query: str, n: int, **kwargs: Any) -> str:
+        api_key = self.config.api_key or os.environ.get("SERPER_API_KEY", "")
+        if not api_key:
+            logger.warning("SERPER_API_KEY not set, falling back to DuckDuckGo")
+            return await self._search_duckduckgo(query, n)
+
+        search_type = (
+            kwargs.get("searchType")
+            or kwargs.get("search_type")
+            or self.config.search_type
+            or "search"
+        )
+        payload: dict[str, Any] = {"q": query}
+        country = kwargs.get("country") or self.config.country
+        language = kwargs.get("language") or self.config.language
+        tbs = kwargs.get("tbs") or self.config.tbs
+        page = kwargs.get("page") or self.config.page
+        autocorrect = (
+            kwargs.get("autocorrect")
+            if kwargs.get("autocorrect") is not None
+            else self.config.autocorrect
+        )
+        if country:
+            payload["gl"] = country
+        if language:
+            payload["hl"] = language
+        if tbs:
+            payload["tbs"] = tbs
+        if page:
+            payload["page"] = page
+        if autocorrect is not None:
+            payload["autocorrect"] = autocorrect
+        if search_type:
+            payload["type"] = str(search_type).lstrip("/")
+
+        request_url = self._serper_request_url(str(search_type) if search_type else None)
+        is_valid, error_msg = _validate_url(request_url)
+        if not is_valid:
+            return f"Error: invalid Serper URL: {error_msg}"
+        try:
+            async with httpx.AsyncClient(proxy=self.proxy) as client:
+                r = await client.post(
+                    request_url,
+                    json=payload,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": self.user_agent,
+                        "X-API-KEY": api_key,
+                    },
+                    timeout=self.config.timeout,
+                )
+                r.raise_for_status()
+            return _format_results(query, self._serper_results(r.json(), str(search_type)), n)
+        except Exception as e:
+            return f"Error: {e}"
 
     async def _search_olostep(self, query: str, n: int) -> str:
         try:

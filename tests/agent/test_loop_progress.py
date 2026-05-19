@@ -218,6 +218,52 @@ class TestToolEventProgress:
         assert all(item[0] != "I will inspect it." for item in progress)
 
     @pytest.mark.asyncio
+    async def test_usage_progress_is_emitted_before_stream_end(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming channels need usage before final card close so token charts can refresh."""
+        loop = _make_loop(tmp_path)
+        loop.provider.chat_stream_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content="Done",
+                tool_calls=[],
+                usage={"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            )
+        )
+        loop.provider.chat_with_retry = AsyncMock()
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        events: list[tuple[str, list[dict] | None]] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+        ) -> None:
+            events.append(("progress", tool_events))
+
+        async def on_stream(_delta: str) -> None:
+            events.append(("stream", None))
+
+        async def on_stream_end(*, resuming: bool = False) -> None:
+            events.append(("end", None))
+
+        await loop._run_agent_loop(
+            [],
+            on_progress=on_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+        )
+
+        usage_idx = next(
+            i for i, (_, tool_events) in enumerate(events)
+            if tool_events and tool_events[0]["phase"] == "usage"
+        )
+        end_idx = next(i for i, (kind, _) in enumerate(events) if kind == "end")
+        assert usage_idx < end_idx
+
+    @pytest.mark.asyncio
     async def test_websocket_dispatch_publishes_final_turn_end_marker(self, tmp_path: Path) -> None:
         bus = MessageBus()
         provider = MagicMock()

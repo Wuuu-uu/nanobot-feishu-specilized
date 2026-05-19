@@ -194,6 +194,20 @@ def parse_response_output(response: Any) -> LLMResponse:
             "completion_tokens": int(usage_raw.get("output_tokens") or 0),
             "total_tokens": int(usage_raw.get("total_tokens") or 0),
         }
+        input_details = usage_raw.get("input_tokens_details") or {}
+        if not isinstance(input_details, dict):
+            dump = getattr(input_details, "model_dump", None)
+            input_details = dump() if callable(dump) else vars(input_details)
+        cached = int(input_details.get("cached_tokens") or 0) if input_details else 0
+        if cached:
+            usage["cached_tokens"] = cached
+        output_details = usage_raw.get("output_tokens_details") or {}
+        if not isinstance(output_details, dict):
+            dump = getattr(output_details, "model_dump", None)
+            output_details = dump() if callable(dump) else vars(output_details)
+        reasoning = int(output_details.get("reasoning_tokens") or 0) if output_details else 0
+        if reasoning:
+            usage["reasoning_tokens"] = reasoning
 
     status = response.get("status")
     finish_reason = map_finish_reason(status)
@@ -278,11 +292,23 @@ async def consume_sdk_stream(
             if resp:
                 usage_obj = getattr(resp, "usage", None)
                 if usage_obj:
+                    input_details = getattr(usage_obj, "input_tokens_details", None)
+                    output_details = getattr(usage_obj, "output_tokens_details", None)
                     usage = {
                         "prompt_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
                         "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
                         "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
                     }
+                    cached = int(getattr(input_details, "cached_tokens", 0) or 0) if input_details else 0
+                    if cached:
+                        usage["cached_tokens"] = cached
+                    reasoning = (
+                        int(getattr(output_details, "reasoning_tokens", 0) or 0)
+                        if output_details
+                        else 0
+                    )
+                    if reasoning:
+                        usage["reasoning_tokens"] = reasoning
                 for out_item in getattr(resp, "output", None) or []:
                     if getattr(out_item, "type", None) == "reasoning":
                         for s in getattr(out_item, "summary", None) or []:

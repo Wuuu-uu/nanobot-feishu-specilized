@@ -396,6 +396,72 @@ class WriteFileTool(_FsTool):
 
 
 # ---------------------------------------------------------------------------
+# append_file
+# ---------------------------------------------------------------------------
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        path=StringSchema("The file path to append to"),
+        content=StringSchema("The content to append"),
+        create=BooleanSchema(
+            description="Create the file when it does not exist (default true)",
+            default=True,
+        ),
+        newline=BooleanSchema(
+            description="Insert a newline before appended content when needed (default true)",
+            default=True,
+        ),
+        required=["path", "content"],
+    )
+)
+class AppendFileTool(_FsTool):
+    """Append content to a file without overwriting existing content."""
+
+    @property
+    def name(self) -> str:
+        return "append_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Append content to a file. Creates parent directories as needed. "
+            "Use write_file only when you intend to replace the whole file."
+        )
+
+    async def execute(
+        self,
+        path: str | None = None,
+        content: str | None = None,
+        create: bool = True,
+        newline: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        try:
+            if not path:
+                raise ValueError("Unknown path")
+            if content is None:
+                raise ValueError("Unknown content")
+            fp = self._resolve(path)
+            if not fp.exists():
+                if not create:
+                    return f"Error: File not found: {path}"
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(content, encoding="utf-8")
+            else:
+                raw = fp.read_text(encoding="utf-8")
+                prefix = "\n" if newline and raw and not raw.endswith("\n") else ""
+                with open(fp, "a", encoding="utf-8") as f:
+                    f.write(prefix + content)
+            self._file_states.record_write(fp)
+            return f"Successfully appended {len(content)} characters to {fp}"
+        except PermissionError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error appending file: {e}"
+
+
+# ---------------------------------------------------------------------------
 # edit_file
 # ---------------------------------------------------------------------------
 

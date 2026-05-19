@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
@@ -261,6 +261,42 @@ class FeishuConfig(Base):
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
+_TOOL_LOGS_ELEMENT_ID = "tool_logs_markdown"
+_TOKEN_CHART_ELEMENT_ID = "token_budget_chart"
+_TOKEN_CHART_HEIGHT = "56px"
+_TOOL_LOGS_TEXT_SIZE = "normal"
+_STREAM_SEGMENT_SEPARATOR = "\n\n---\n\n"
+_EMPTY_TOOL_LOGS_MARKDOWN = "**工具调用记录**\n\n暂无工具调用。"
+
+_TOOL_DISPLAY_NAMES: dict[str, str] = {
+    "ask_user": "询问用户",
+    "append_file": "追加文件",
+    "cron": "定时任务",
+    "edit_file": "编辑文件",
+    "exec": "执行命令",
+    "glob": "匹配文件",
+    "grep": "搜索文件",
+    "image_generate": "图像生成",
+    "list_dir": "列出目录",
+    "memory_search": "记忆检索",
+    "message": "发送消息",
+    "my": "运行状态",
+    "notebook_edit": "编辑 Notebook",
+    "notion": "Notion",
+    "pdf_mineru": "文档解析",
+    "read_file": "读取文件",
+    "session_manage": "会话管理",
+    "spawn": "子任务",
+    "web_fetch": "读取网页",
+    "web_search": "网络搜索",
+    "write_file": "写入文件",
+}
+
+_TOOL_PHASE_LABELS: dict[str, str] = {
+    "start": "执行中",
+    "end": "已完成",
+    "error": "失败",
+}
 
 
 @dataclass
@@ -271,6 +307,9 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
+    token_usage: dict[str, int] = field(default_factory=dict)
+    needs_segment_separator: bool = False
 
 
 class FeishuChannel(BaseChannel):
@@ -637,6 +676,7 @@ class FeishuChannel(BaseChannel):
     _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
     _CODE_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
+    _INDENTED_CODE_FENCE_RE = re.compile(r"^([ \t]{1,3})(`{3,}|~{3,})(.*)$")
 
     # Markdown formatting patterns that should be stripped from plain-text
     # surfaces like table cells and heading text.
@@ -734,6 +774,7 @@ class FeishuChannel(BaseChannel):
 
     def _split_headings(self, content: str) -> list[dict]:
         """Split content by headings, converting headings to div elements."""
+        content = self._normalize_card_markdown(content)
         protected = content
         code_blocks = []
         for m in self._CODE_BLOCK_RE.finditer(content):
@@ -768,6 +809,49 @@ class FeishuChannel(BaseChannel):
                     el["content"] = el["content"].replace(f"\x00CODE{i}\x00", cb)
 
         return elements or [{"tag": "markdown", "content": content}]
+
+    @classmethod
+    def _normalize_card_markdown(cls, content: str) -> str:
+        """Normalize Markdown constructs that Feishu CardKit renders unreliably.
+
+        Feishu often drops fenced code blocks when they are indented under list
+        items. CommonMark allows up to three leading spaces before a fence, so
+        lift those blocks to column zero before sending them to CardKit.
+        """
+        if "```" not in content and "~~~" not in content:
+            return content
+
+        lines = content.splitlines(keepends=True)
+        normalized: list[str] = []
+        fence_indent = ""
+        fence_char = ""
+        fence_len = 0
+        in_fence = False
+
+        for line in lines:
+            raw = line.rstrip("\r\n")
+            newline = line[len(raw):]
+            if not in_fence:
+                match = cls._INDENTED_CODE_FENCE_RE.match(raw)
+                if match:
+                    fence_indent, fence_marker, rest = match.groups()
+                    fence_char = fence_marker[0]
+                    fence_len = len(fence_marker)
+                    in_fence = True
+                    normalized.append(f"{fence_marker}{rest}{newline}")
+                    continue
+                normalized.append(line)
+                continue
+
+            lifted = raw[len(fence_indent):] if raw.startswith(fence_indent) else raw
+            normalized.append(f"{lifted}{newline}")
+            if lifted.startswith(fence_char * fence_len):
+                in_fence = False
+                fence_indent = ""
+                fence_char = ""
+                fence_len = 0
+
+        return "".join(normalized)
 
     # ── Smart format detection ──────────────────────────────────────────
     # Patterns that indicate "complex" markdown needing card rendering
@@ -1228,6 +1312,8 @@ class FeishuChannel(BaseChannel):
         reply_message_id: str | None = None,
         *,
         reply_in_thread: bool = False,
+        tool_logs: str | None = None,
+        token_usage: dict[str, int] | None = None,
     ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id.
 
@@ -1238,20 +1324,71 @@ class FeishuChannel(BaseChannel):
         """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
-        card_json = {
-            "schema": "2.0",
-            "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-            "body": {
-                "elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]
-            },
-        }
-        try:
+        def _card_payload(include_observability: bool, include_chart: bool) -> dict[str, Any]:
+            elements: list[dict[str, Any]] = []
+            if include_observability:
+                elements.append({
+                    "tag": "collapsible_panel",
+                    "element_id": "tool_logs_panel",
+                    "expanded": False,
+                    "vertical_spacing": "8px",
+                    "padding": "8px 8px 8px 8px",
+                    "background_color": "grey",
+                    "header": {
+                        "title": {
+                            "tag": "markdown",
+                            "content": "**工具调用详情**",
+                        },
+                        "background_color": "grey",
+                        "icon": {
+                            "tag": "standard_icon",
+                            "token": "down-small-ccm_outlined",
+                            "size": "16px 16px",
+                        },
+                        "icon_position": "right",
+                        "icon_expanded_angle": -180,
+                    },
+                    "border": {
+                        "color": "grey",
+                        "corner_radius": "5px",
+                    },
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": tool_logs or self._format_observability_markdown([], {}),
+                            "element_id": _TOOL_LOGS_ELEMENT_ID,
+                            "text_size": _TOOL_LOGS_TEXT_SIZE,
+                        }
+                    ],
+                })
+            elements.append({"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID})
+            if include_chart:
+                elements.extend([
+                    {"tag": "hr", "margin": "0px 0px 0px 0px"},
+                    {
+                        "tag": "chart",
+                        "chart_spec": self._token_chart_spec(token_usage or {}),
+                        "element_id": _TOKEN_CHART_ELEMENT_ID,
+                        "color_theme": "complementary",
+                        "height": _TOKEN_CHART_HEIGHT,
+                        "margin": "0px 0px 0px 0px",
+                    },
+                ])
+            return {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
+                "body": {"elements": elements},
+            }
+
+        card_json = _card_payload(include_observability=True, include_chart=True)
+
+        def _create_card(payload: dict[str, Any]) -> str | None:
             request = (
                 CreateCardRequest.builder()
                 .request_body(
                     CreateCardRequestBody.builder()
                     .type("card_json")
-                    .data(json.dumps(card_json, ensure_ascii=False))
+                    .data(json.dumps(payload, ensure_ascii=False))
                     .build()
                 )
                 .build()
@@ -1262,7 +1399,16 @@ class FeishuChannel(BaseChannel):
                     "Failed to create streaming card: code={}, msg={}", response.code, response.msg
                 )
                 return None
-            card_id = getattr(response.data, "card_id", None)
+            return getattr(response.data, "card_id", None)
+
+        try:
+            card_id = _create_card(card_json)
+            if not card_id:
+                logger.warning("Retrying streaming card creation without token chart")
+                card_id = _create_card(_card_payload(include_observability=True, include_chart=False))
+            if not card_id:
+                logger.warning("Retrying streaming card creation without observability panel")
+                card_id = _create_card(_card_payload(include_observability=False, include_chart=False))
             if card_id:
                 card_content = json.dumps(
                     {"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False
@@ -1286,7 +1432,13 @@ class FeishuChannel(BaseChannel):
             logger.warning("Error creating streaming card: {}", e)
             return None
 
-    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
+    def _stream_update_text_sync(
+        self,
+        card_id: str,
+        content: str,
+        sequence: int,
+        element_id: str = _STREAM_ELEMENT_ID,
+    ) -> bool:
         """Stream-update the markdown element on a CardKit card (typewriter effect)."""
         from lark_oapi.api.cardkit.v1 import (
             ContentCardElementRequest,
@@ -1294,10 +1446,11 @@ class FeishuChannel(BaseChannel):
         )
 
         try:
+            content = self._normalize_card_markdown(content)
             request = (
                 ContentCardElementRequest.builder()
                 .card_id(card_id)
-                .element_id(_STREAM_ELEMENT_ID)
+                .element_id(element_id)
                 .request_body(
                     ContentCardElementRequestBody.builder()
                     .content(content)
@@ -1357,6 +1510,253 @@ class FeishuChannel(BaseChannel):
             logger.warning("Error closing streaming on card {}: {}", card_id, e)
             return False
 
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            if value is None or isinstance(value, bool):
+                return 0
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _tool_display_name(cls, raw_name: str) -> str:
+        label = _TOOL_DISPLAY_NAMES.get(raw_name)
+        if label:
+            return f"{label} (`{raw_name}`)"
+        return f"`{raw_name or 'tool'}`"
+
+    @staticmethod
+    def _truncate_inline(value: Any, max_chars: int = 220) -> str:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                text = str(value)
+        text = " ".join(str(text).split())
+        return text if len(text) <= max_chars else text[:max_chars] + "...（已截断）"
+
+    @classmethod
+    def _format_json_preview(cls, value: Any, max_chars: int = 900) -> str:
+        if value in (None, "", {}, []):
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, indent=2)
+            except TypeError:
+                text = str(value)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n...（已截断）"
+        return text.replace("```", "'''")
+
+    @classmethod
+    def _merge_tool_events(cls, tool_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for index, event in enumerate(tool_events[-50:]):
+            if not isinstance(event, dict) or event.get("phase") == "usage":
+                continue
+            call_id = str(event.get("call_id") or "")
+            name = str(event.get("name") or "tool")
+            key = call_id or f"{name}:{index}"
+            item = merged.setdefault(
+                key,
+                {
+                    "name": name,
+                    "call_id": call_id,
+                    "phase": "start",
+                    "arguments": {},
+                    "result": None,
+                    "error": None,
+                    "files": [],
+                    "embeds": [],
+                },
+            )
+            if name and item.get("name") == "tool":
+                item["name"] = name
+            if event.get("arguments"):
+                item["arguments"] = event.get("arguments")
+            phase = str(event.get("phase") or event.get("status") or "").lower()
+            if phase:
+                item["phase"] = phase
+            if event.get("result") not in (None, "", {}, []):
+                item["result"] = event.get("result")
+            if event.get("error"):
+                item["error"] = event.get("error")
+                item["phase"] = "error"
+            for key_name in ("files", "embeds"):
+                values = event.get(key_name)
+                if isinstance(values, list) and values:
+                    item[key_name] = values
+        return list(merged.values())
+
+    @classmethod
+    def _format_observability_markdown(
+        cls,
+        tool_events: list[dict[str, Any]],
+        token_usage: dict[str, int],
+    ) -> str:
+        merged = cls._merge_tool_events(tool_events)
+        if not merged and not token_usage:
+            return _EMPTY_TOOL_LOGS_MARKDOWN
+
+        lines: list[str] = ["**工具调用记录**"]
+        if merged:
+            for idx, item in enumerate(merged[-20:], start=1):
+                phase = str(item.get("phase") or "start").lower()
+                status = _TOOL_PHASE_LABELS.get(phase, phase or "已更新")
+                name = str(item.get("name") or "tool")
+                lines.append(f"{idx}. **{cls._tool_display_name(name)}** - {status}")
+                args_preview = cls._format_json_preview(item.get("arguments"), max_chars=700)
+                if args_preview:
+                    lines.append("   - 参数:")
+                    lines.append(f"```json\n{args_preview}\n```\n")
+                if item.get("error"):
+                    lines.append(f"   - 错误: `{cls._truncate_inline(item['error'], 260)}`")
+                elif item.get("result") not in (None, "", {}, []):
+                    result_preview = cls._format_json_preview(item["result"], max_chars=900)
+                    result_lang = "" if isinstance(item["result"], str) else "json"
+                    lines.append("   - 结果:")
+                    lines.append(f"```{result_lang}\n{result_preview}\n```\n")
+                files = item.get("files") if isinstance(item.get("files"), list) else []
+                embeds = item.get("embeds") if isinstance(item.get("embeds"), list) else []
+                if files or embeds:
+                    lines.append(f"   - 附件: {len(files)} 个文件，{len(embeds)} 个嵌入结果")
+        else:
+            lines.append("暂无工具调用。")
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _token_chart_spec(cls, token_usage: dict[str, int]) -> dict[str, Any]:
+        prompt = cls._safe_int(token_usage.get("prompt_tokens"))
+        completion = cls._safe_int(token_usage.get("completion_tokens"))
+        total = cls._safe_int(token_usage.get("total_tokens"))
+        cached = max(
+            cls._safe_int(token_usage.get("cached_tokens")),
+            cls._safe_int(token_usage.get("cache_tokens")),
+        )
+        input_tokens = max(prompt, max(0, total - completion))
+        cached = min(cached, input_tokens)
+        uncached = max(0, input_tokens - cached)
+        values = [
+            {"category": "token用量", "item": "缓存输入", "value": cached},
+            {"category": "token用量", "item": "非缓存输入", "value": uncached},
+            {"category": "token用量", "item": "输出", "value": completion},
+        ]
+        return {
+            "type": "bar",
+            "direction": "horizontal",
+            "title": {"text": "token用量占比图"},
+            "data": {"values": values},
+            "xField": "value",
+            "yField": "category",
+            "seriesField": "item",
+            "stack": True,
+            "legends": {"visible": True, "orient": "bottom"},
+            "label": {"visible": True, "formatter": "value"},
+        }
+
+    def _patch_card_element_sync(
+        self,
+        card_id: str,
+        element_id: str,
+        partial_element: dict[str, Any],
+        sequence: int,
+    ) -> bool:
+        """Patch a CardKit element property set, used for token chart refresh."""
+        from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
+
+        try:
+            request = (
+                PatchCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(
+                    PatchCardElementRequestBody.builder()
+                    .partial_element(json.dumps(partial_element, ensure_ascii=False))
+                    .sequence(sequence)
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.cardkit.v1.card_element.patch(request)
+            if not response.success():
+                logger.debug(
+                    "Failed to patch card {} element {}: code={}, msg={}",
+                    card_id,
+                    element_id,
+                    response.code,
+                    response.msg,
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.debug("Error patching card {} element {}: {}", card_id, element_id, e)
+            return False
+
+    @staticmethod
+    def _apply_tool_events(buf: _FeishuStreamBuf, events: list[dict[str, Any]]) -> bool:
+        changed = False
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if event.get("phase") == "usage" and isinstance(event.get("usage"), dict):
+                cached_values: list[int] = []
+                for key, value in event["usage"].items():
+                    try:
+                        parsed = int(value or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if parsed < 0:
+                        continue
+                    if key in {"cached_tokens", "cache_tokens"}:
+                        cached_values.append(parsed)
+                        continue
+                    buf.token_usage[key] = buf.token_usage.get(key, 0) + parsed
+                if cached_values:
+                    buf.token_usage["cached_tokens"] = (
+                        buf.token_usage.get("cached_tokens", 0) + max(cached_values)
+                    )
+                changed = True
+                continue
+            if event.get("name") or event.get("phase"):
+                buf.tool_events.append(dict(event))
+                buf.tool_events = buf.tool_events[-50:]
+                changed = True
+        return changed
+
+    async def _flush_observability(self, buf: _FeishuStreamBuf) -> None:
+        if not buf.card_id:
+            return
+        text = self._format_observability_markdown(buf.tool_events, buf.token_usage)
+        buf.sequence += 1
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(
+            None,
+            self._stream_update_text_sync,
+            buf.card_id,
+            text,
+            buf.sequence,
+            _TOOL_LOGS_ELEMENT_ID,
+        )
+        if not ok:
+            logger.debug("Feishu observability panel update failed; continuing text stream")
+        if buf.token_usage:
+            buf.sequence += 1
+            await loop.run_in_executor(
+                None,
+                self._patch_card_element_sync,
+                buf.card_id,
+                _TOKEN_CHART_ELEMENT_ID,
+                {"chart_spec": self._token_chart_spec(buf.token_usage)},
+                buf.sequence,
+            )
+
     async def send_delta(
         self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
     ) -> None:
@@ -1375,6 +1775,14 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
+        if isinstance(meta.get("_tool_events"), list):
+            buf = self._stream_bufs.get(stream_key)
+            if buf is None:
+                buf = _FeishuStreamBuf()
+                self._stream_bufs[stream_key] = buf
+            if self._apply_tool_events(buf, meta["_tool_events"]) and buf.card_id:
+                await self._flush_observability(buf)
+
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             message_id = meta.get("message_id")
@@ -1391,21 +1799,46 @@ class FeishuChannel(BaseChannel):
                 if self.config.done_emoji:
                     await self._add_reaction(message_id, self.config.done_emoji)
 
+            if meta.get("_resuming"):
+                buf = self._stream_bufs.get(stream_key)
+                if not buf:
+                    return
+                if buf.text.strip():
+                    buf.needs_segment_separator = True
+                if buf.card_id and buf.text:
+                    buf.sequence += 1
+                    ok = await loop.run_in_executor(
+                        None,
+                        self._stream_update_text_sync,
+                        buf.card_id,
+                        buf.text,
+                        buf.sequence,
+                    )
+                    if ok:
+                        buf.last_edit = time.monotonic()
+                    else:
+                        logger.debug(
+                            "Feishu resuming stream update failed; keeping buffer for final fallback"
+                        )
+                return
+
             buf = self._stream_bufs.pop(stream_key, None)
-            if not buf or not buf.text:
+            if not buf:
                 return
             # Try to finalize via streaming card; if that fails (e.g.
             # streaming mode was closed by Feishu due to timeout), fall
             # back to sending a regular interactive card.
             if buf.card_id:
-                buf.sequence += 1
-                ok = await loop.run_in_executor(
-                    None,
-                    self._stream_update_text_sync,
-                    buf.card_id,
-                    buf.text,
-                    buf.sequence,
-                )
+                ok = True
+                if buf.text:
+                    buf.sequence += 1
+                    ok = await loop.run_in_executor(
+                        None,
+                        self._stream_update_text_sync,
+                        buf.card_id,
+                        buf.text,
+                        buf.sequence,
+                    )
                 if ok:
                     buf.sequence += 1
                     await loop.run_in_executor(
@@ -1419,9 +1852,37 @@ class FeishuChannel(BaseChannel):
                     "Streaming card {} final update failed, falling back to regular card",
                     buf.card_id,
                 )
-            for chunk in self._split_elements_by_table_limit(
-                self._build_card_elements(buf.text)
-            ):
+            if not buf.text:
+                return
+            fallback_elements = self._build_card_elements(buf.text)
+            obs = self._format_observability_markdown(buf.tool_events, buf.token_usage)
+            if obs != _EMPTY_TOOL_LOGS_MARKDOWN:
+                fallback_elements.insert(0, {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "background_color": "grey",
+                    "header": {
+                        "title": {"tag": "markdown", "content": "**工具调用详情**"},
+                        "background_color": "grey",
+                    },
+                    "border": {"color": "grey", "corner_radius": "5px"},
+                    "elements": [{
+                        "tag": "markdown",
+                        "content": obs,
+                        "text_size": _TOOL_LOGS_TEXT_SIZE,
+                    }],
+                })
+            if buf.token_usage:
+                fallback_elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
+                fallback_elements.append({
+                    "tag": "chart",
+                    "chart_spec": self._token_chart_spec(buf.token_usage),
+                    "element_id": _TOKEN_CHART_ELEMENT_ID,
+                    "color_theme": "complementary",
+                    "height": _TOKEN_CHART_HEIGHT,
+                    "margin": "0px 0px 0px 0px",
+                })
+            for chunk in self._split_elements_by_table_limit(fallback_elements):
                 card = json.dumps(
                     {"config": {"wide_screen_mode": True}, "elements": chunk},
                     ensure_ascii=False,
@@ -1447,6 +1908,10 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[stream_key] = buf
+        if buf.needs_segment_separator and delta.strip():
+            buf.text = buf.text.rstrip() + _STREAM_SEGMENT_SEPARATOR
+            delta = delta.lstrip()
+            buf.needs_segment_separator = False
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1464,6 +1929,11 @@ class FeishuChannel(BaseChannel):
                     chat_id,
                     reply_msg_id,
                     reply_in_thread=use_reply_in_thread,
+                    tool_logs=self._format_observability_markdown(
+                        buf.tool_events,
+                        buf.token_usage,
+                    ),
+                    token_usage=buf.token_usage,
                 ),
             )
             if card_id:
@@ -1490,28 +1960,78 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            if isinstance(msg.metadata.get("_tool_events"), list):
+                buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
+                if buf is None:
+                    buf = _FeishuStreamBuf()
+                    self._stream_bufs[self._stream_key(msg.chat_id, msg.metadata)] = buf
+                changed = self._apply_tool_events(buf, msg.metadata["_tool_events"])
+                if changed and buf.card_id:
+                    await self._flush_observability(buf)
+                if not msg.content and not msg.metadata.get("_tool_hint"):
+                    return
+
             # Handle tool hint messages.  When a streaming card is active for
-            # this chat, inline the hint into the card instead of sending a
-            # separate message so the user experience stays cohesive.
+            # this chat, the structured tool panel already carries the visible
+            # progress; keep the main answer area free of raw function-call text.
             if msg.metadata.get("_tool_hint"):
                 hint = (msg.content or "").strip()
                 if not hint:
                     return
                 buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
-                if buf and buf.card_id:
-                    # Delegate to send_delta so tool hints get the same
-                    # throttling (and card creation) as regular text deltas.
-                    await self.send_delta(
-                        msg.chat_id,
-                        "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
-                    )
+                if msg.metadata.get("_wants_stream"):
+                    if buf is None:
+                        buf = _FeishuStreamBuf()
+                        self._stream_bufs[self._stream_key(msg.chat_id, msg.metadata)] = buf
+                    if not msg.metadata.get("_tool_events"):
+                        buf.tool_events.append({
+                            "version": 1,
+                            "phase": "start",
+                            "name": "tool",
+                            "arguments": {"调用": hint},
+                            "result": None,
+                            "error": None,
+                            "files": [],
+                            "embeds": [],
+                        })
+                        buf.tool_events = buf.tool_events[-50:]
+                    if buf.card_id:
+                        await self._flush_observability(buf)
                     return
-                # No active streaming card — send as a regular interactive card
-                # with the same 🔧 prefix style. Existing topics stay threaded;
-                # new topics are created only when reply-to-message is enabled.
+                if buf and buf.card_id:
+                    if not msg.metadata.get("_tool_events"):
+                        buf.tool_events.append({
+                            "version": 1,
+                            "phase": "start",
+                            "name": "tool",
+                            "arguments": {"调用": hint},
+                            "result": None,
+                            "error": None,
+                            "files": [],
+                            "embeds": [],
+                        })
+                        buf.tool_events = buf.tool_events[-50:]
+                        await self._flush_observability(buf)
+                    return
+                # Non-streaming fallback: use a small structured card instead
+                # of a raw English function-call line.
                 card = json.dumps(
                     {"config": {"wide_screen_mode": True}, "elements": [
-                        {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
+                        {
+                            "tag": "collapsible_panel",
+                            "expanded": True,
+                            "background_color": "grey",
+                            "header": {
+                                "title": {"tag": "markdown", "content": "**工具调用详情**"},
+                                "background_color": "grey",
+                            },
+                            "border": {"color": "grey", "corner_radius": "5px"},
+                            "elements": [{
+                                "tag": "markdown",
+                                "content": f"**工具调用记录**\n\n- `{hint}`",
+                                "text_size": _TOOL_LOGS_TEXT_SIZE,
+                            }],
+                        },
                     ]},
                     ensure_ascii=False,
                 )
@@ -1541,6 +2061,16 @@ class FeishuChannel(BaseChannel):
             # For topic group messages, always reply to keep context in thread
             elif msg.metadata.get("thread_id"):
                 reply_message_id = _msg_id
+
+            final_buf = None
+            if (
+                not msg.metadata.get("_progress")
+                and not msg.metadata.get("_tool_hint")
+                and not msg.metadata.get("_stream_delta")
+                and not msg.metadata.get("_stream_end")
+                and not msg.metadata.get("_streamed")
+            ):
+                final_buf = self._stream_bufs.pop(self._stream_key(msg.chat_id, msg.metadata), None)
 
             first_send = True  # tracks whether the reply has already been used
 
@@ -1597,6 +2127,48 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
+                if final_buf and (final_buf.tool_events or final_buf.token_usage):
+                    elements = self._build_card_elements(msg.content)
+                    obs = self._format_observability_markdown(
+                        final_buf.tool_events,
+                        final_buf.token_usage,
+                    )
+                    if obs != _EMPTY_TOOL_LOGS_MARKDOWN:
+                        elements.insert(0, {
+                            "tag": "collapsible_panel",
+                            "expanded": False,
+                            "background_color": "grey",
+                            "header": {
+                                "title": {"tag": "markdown", "content": "**工具调用详情**"},
+                                "background_color": "grey",
+                            },
+                            "border": {"color": "grey", "corner_radius": "5px"},
+                            "elements": [{
+                                "tag": "markdown",
+                                "content": obs,
+                                "text_size": _TOOL_LOGS_TEXT_SIZE,
+                            }],
+                        })
+                    if final_buf.token_usage:
+                        elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
+                        elements.append({
+                            "tag": "chart",
+                            "chart_spec": self._token_chart_spec(final_buf.token_usage),
+                            "element_id": _TOKEN_CHART_ELEMENT_ID,
+                            "color_theme": "complementary",
+                            "height": _TOKEN_CHART_HEIGHT,
+                            "margin": "0px 0px 0px 0px",
+                        })
+                    for chunk in self._split_elements_by_table_limit(elements):
+                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                        await loop.run_in_executor(
+                            None,
+                            _do_send,
+                            "interactive",
+                            json.dumps(card, ensure_ascii=False),
+                        )
+                    return
+
                 fmt = self._detect_msg_format(msg.content)
 
                 if fmt == "text":

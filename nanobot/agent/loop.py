@@ -29,12 +29,23 @@ from nanobot.agent.tools.ask import (
 )
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.filesystem import (
+    AppendFileTool,
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from nanobot.agent.tools.image_generate import ImageGenerateTool
+from nanobot.agent.tools.memory_search import MemorySearchTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.notion import NotionTool
+from nanobot.agent.tools.pdf_mineru import MineruPdfParseTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.session_manage import SessionManageTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -91,6 +102,7 @@ class _LoopHook(AgentHook):
         self._metadata = metadata or {}
         self._session_key = session_key
         self._stream_buf = ""
+        self._usage_progress_sent_iterations: set[int] = set()
 
     def wants_streaming(self) -> bool:
         return self._on_stream is not None
@@ -106,9 +118,31 @@ class _LoopHook(AgentHook):
             await self._on_stream(incremental)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        await self._emit_usage_progress(context)
         if self._on_stream_end:
             await self._on_stream_end(resuming=resuming)
         self._stream_buf = ""
+
+    async def _emit_usage_progress(self, context: AgentHookContext) -> bool:
+        if (
+            not self._on_progress
+            or not context.usage
+            or context.iteration in self._usage_progress_sent_iterations
+            or not on_progress_accepts_tool_events(self._on_progress)
+        ):
+            return False
+        self._usage_progress_sent_iterations.add(context.iteration)
+        await invoke_on_progress(
+            self._on_progress,
+            "",
+            tool_hint=False,
+            tool_events=[{
+                "version": 1,
+                "phase": "usage",
+                "usage": dict(context.usage),
+            }],
+        )
+        return True
 
     async def before_iteration(self, context: AgentHookContext) -> None:
         self._loop._current_iteration = context.iteration
@@ -148,6 +182,13 @@ class _LoopHook(AgentHook):
             and on_progress_accepts_tool_events(self._on_progress)
         ):
             tool_events = build_tool_event_finish_payloads(context)
+            if context.usage and context.iteration not in self._usage_progress_sent_iterations:
+                self._usage_progress_sent_iterations.add(context.iteration)
+                tool_events.append({
+                    "version": 1,
+                    "phase": "usage",
+                    "usage": dict(context.usage),
+                })
             if tool_events:
                 await invoke_on_progress(
                     self._on_progress,
@@ -155,6 +196,12 @@ class _LoopHook(AgentHook):
                     tool_hint=False,
                     tool_events=tool_events,
                 )
+        elif (
+            self._on_progress
+            and context.usage
+            and on_progress_accepts_tool_events(self._on_progress)
+        ):
+            await self._emit_usage_progress(context)
         u = context.usage or {}
         logger.debug(
             "LLM usage: prompt={} completion={} cached={}",
@@ -204,6 +251,9 @@ class AgentLoop:
         session_ttl_minutes: int = 0,
         consolidation_ratio: float = 0.5,
         max_messages: int = 120,
+        session_archive_buffer_messages: int = 80,
+        dream_cold_archive_older_than_days: int = 30,
+        dream_allow_topic_edits: bool = True,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
@@ -239,6 +289,7 @@ class AgentLoop:
         self.provider_retry_mode = provider_retry_mode
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
+        self.tools_config = _tc
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -266,6 +317,7 @@ class AgentLoop:
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
+        self._session_file_cap = self._max_messages + max(0, session_archive_buffer_messages)
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
@@ -303,6 +355,10 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            allow_topic_edits=dream_allow_topic_edits,
+        )
+        self.context.memory.cold_archive_older_than_days = max(
+            0, dream_cold_archive_older_than_days,
         )
         self._register_default_tools()
         if _tc.my.enable:
@@ -348,6 +404,7 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        _tc = self.tools_config
         allowed_dir = (
             self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
         )
@@ -362,6 +419,7 @@ class AgentLoop:
         )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(AppendFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
         for cls in (GlobTool, GrepTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -394,6 +452,26 @@ class AgentLoop:
                 )
             )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound, workspace=self.workspace))
+        if _tc.image_gen.enabled and _tc.image_gen.api_base and _tc.image_gen.api_key and _tc.image_gen.model_name:
+            self.tools.register(
+                ImageGenerateTool(
+                    config=_tc.image_gen,
+                    workspace=self.workspace,
+                    allowed_dir=allowed_dir,
+                    send_callback=self.bus.publish_outbound,
+                )
+            )
+        if (
+            _tc.notion.enabled
+            and _tc.notion.api_key
+            and (_tc.notion.database_id or any(_tc.notion.type_database_map.values()))
+        ):
+            self.tools.register(NotionTool(config=_tc.notion, allowed_dir=allowed_dir))
+        if _tc.mineru.enabled and _tc.mineru.api_url and _tc.mineru.token:
+            self.tools.register(MineruPdfParseTool(config=_tc.mineru, allowed_dir=allowed_dir))
+        if _tc.memory_system.enabled:
+            self.tools.register(MemorySearchTool(workspace=self.workspace, config=_tc.memory_system))
+        self.tools.register(SessionManageTool(manager=self.sessions))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -438,7 +516,7 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY
         else:
             effective_key = f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "my"):
+        for name in ("message", "spawn", "cron", "my", "image_generate", "session_manage"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "spawn":
@@ -503,8 +581,14 @@ class AgentLoop:
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
-        if self._unified_session and not msg.session_key_override:
+        if msg.session_key_override:
+            return msg.session_key_override
+        if self._unified_session:
             return UNIFIED_SESSION_KEY
+        if msg.channel != "system":
+            active = self.sessions.get_active_session_key(msg.channel, msg.chat_id)
+            if isinstance(active, str) and active:
+                return active
         return msg.session_key
 
     def _replay_token_budget(self) -> int:
@@ -951,7 +1035,10 @@ class AgentLoop:
                 pending_queue=pending_queue,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
-            session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+            session.enforce_file_cap(
+                on_archive=self.context.memory.raw_archive,
+                limit=self._session_file_cap,
+            )
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
@@ -988,7 +1075,7 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        key = session_key or msg.session_key
+        key = session_key or self._effective_session_key(msg)
         session = self.sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
@@ -1110,7 +1197,10 @@ class AgentLoop:
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
         self._save_turn(session, all_msgs, save_skip)
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+        session.enforce_file_cap(
+            on_archive=self.context.memory.raw_archive,
+            limit=self._session_file_cap,
+        )
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)

@@ -1,4 +1,4 @@
-from nanobot.config.schema import DreamConfig
+from nanobot.config.schema import AgentDefaults, DreamConfig
 
 
 def test_dream_config_defaults_to_interval_hours() -> None:
@@ -6,6 +6,8 @@ def test_dream_config_defaults_to_interval_hours() -> None:
 
     assert cfg.interval_h == 2
     assert cfg.cron is None
+    assert cfg.cold_archive_older_than_days == 30
+    assert cfg.allow_topic_edits is True
 
 
 def test_dream_config_builds_every_schedule_from_interval() -> None:
@@ -46,3 +48,26 @@ def test_dream_config_uses_model_override_name_and_accepts_legacy_model() -> Non
     assert cfg.model_override == "openrouter/sonnet"
     assert dumped["modelOverride"] == "openrouter/sonnet"
     assert "model" not in dumped
+
+
+def test_dream_config_accepts_cold_archive_and_topic_aliases() -> None:
+    cfg = DreamConfig.model_validate({
+        "coldArchiveOlderThanDays": 14,
+        "allowTopicEdits": False,
+    })
+
+    dumped = cfg.model_dump(by_alias=True)
+
+    assert cfg.cold_archive_older_than_days == 14
+    assert cfg.allow_topic_edits is False
+    assert dumped["coldArchiveOlderThanDays"] == 14
+    assert dumped["allowTopicEdits"] is False
+
+
+def test_agent_defaults_session_archive_buffer_defaults_and_alias() -> None:
+    defaults = AgentDefaults.model_validate({"sessionArchiveBufferMessages": 50})
+
+    dumped = defaults.model_dump(by_alias=True)
+
+    assert defaults.session_archive_buffer_messages == 50
+    assert dumped["sessionArchiveBufferMessages"] == 50

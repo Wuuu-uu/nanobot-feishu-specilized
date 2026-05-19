@@ -80,6 +80,82 @@ async def test_tavily_search(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_serper_search_posts_google_payload(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://google.serper.dev/search"
+        assert kw["headers"]["X-API-KEY"] == "serper-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
+        assert kw["json"] == {
+            "q": "nanobot",
+            "gl": "us",
+            "hl": "en",
+            "tbs": "qdr:d",
+            "page": 2,
+            "autocorrect": False,
+            "type": "search",
+        }
+        return _response(json={
+            "organic": [
+                {
+                    "title": "Serper Result",
+                    "link": "https://serper.example",
+                    "snippet": "From Serper",
+                }
+            ]
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = WebSearchTool(
+        config=WebSearchConfig(
+            provider="serper",
+            api_key="serper-key",
+            country="us",
+            language="en",
+            tbs="qdr:d",
+            page=2,
+            autocorrect=False,
+        ),
+        user_agent="nanobot-search-test",
+    )
+
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert "Serper Result" in result
+    assert "https://serper.example" in result
+
+
+@pytest.mark.asyncio
+async def test_serper_news_uses_endpoint_host_with_news_path(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://google.serper.dev/news"
+        assert kw["json"]["type"] == "news"
+        return _response(json={
+            "news": [
+                {
+                    "title": "News Result",
+                    "link": "https://news.example",
+                    "snippet": "News from Serper",
+                }
+            ]
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = WebSearchTool(
+        config=WebSearchConfig(
+            provider="serper",
+            api_key="serper-key",
+            endpoint="https://google.serper.dev/search",
+            search_type="news",
+        )
+    )
+
+    result = await tool.execute(query="nanobot", count=1)
+
+    assert "News Result" in result
+    assert "https://news.example" in result
+
+
+@pytest.mark.asyncio
 async def test_searxng_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "searx.example" in url

@@ -150,6 +150,14 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n... (truncated)"
 
 
+def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
+    """Truncate a single string with a compact suffix."""
+    if max_len <= 0 or len(s) <= max_len:
+        return s
+    keep = max(max_len - len(suffix), 0)
+    return s[:keep] + suffix
+
+
 def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
     """Find the first index whose tool results have matching assistant calls."""
     declared: set[str] = set()

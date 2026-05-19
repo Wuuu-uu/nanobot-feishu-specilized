@@ -141,6 +141,25 @@ class TestNestedRepoProtection:
         expected = g._build_gitignore()
         assert gitignore == expected
 
+    def test_glob_tracked_files_are_allowed_in_gitignore_and_commit(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        topics = workspace / "memory" / "topics"
+        topics.mkdir(parents=True)
+        (topics / "project.md").write_text("# Project\n", encoding="utf-8")
+
+        g = GitStore(workspace, tracked_files=["memory/MEMORY.md", "memory/topics/*.md"])
+        assert g.init() is True
+
+        gitignore = (workspace / ".gitignore").read_text(encoding="utf-8")
+        assert "!memory/" in gitignore
+        assert "!memory/topics/" in gitignore
+        assert "!memory/topics/*.md" in gitignore
+
+        (topics / "project.md").write_text("# Project\n- updated\n", encoding="utf-8")
+        sha = g.auto_commit("update topic")
+        assert sha is not None
+
     def test_init_gitignore_merge_idempotent(self, tmp_path):
         """init() should not duplicate Dream entries already in .gitignore."""
         workspace = tmp_path / "workspace"

@@ -9,7 +9,7 @@ import re
 import weakref
 from contextlib import suppress
 import tiktoken
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
@@ -54,8 +54,10 @@ class MemoryStore:
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+        self.cold_archive_older_than_days = 30
+        self.cold_archive_dir = self.memory_dir / "archive" / "session-raw"
         self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
+            "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/topics/*.md",
         ])
         self._maybe_migrate_legacy_history()
 
@@ -408,16 +410,93 @@ class MemoryStore:
         return "\n".join(lines)
 
     def raw_archive(self, messages: list[dict], *, max_chars: int | None = None) -> None:
-        """Fallback: dump raw messages to history.jsonl without LLM summarization."""
+        """Fallback archive for raw messages.
+
+        Recent messages are written to history.jsonl for Dream. Messages older
+        than ``cold_archive_older_than_days`` are preserved under
+        memory/archive/session-raw/ and intentionally skipped by Dream.
+        """
+        if not messages:
+            return
+        recent_count = 0
+        cold_count = 0
+        for is_cold, chunk in self._split_raw_archive_chunks(messages):
+            if is_cold:
+                self._write_cold_archive(chunk, max_chars=max_chars)
+                cold_count += len(chunk)
+            else:
+                self._append_raw_history(chunk, max_chars=max_chars)
+                recent_count += len(chunk)
+        if recent_count:
+            logger.warning(
+                "Memory consolidation degraded: raw-archived {} recent messages",
+                recent_count,
+            )
+        if cold_count:
+            logger.info("Memory consolidation cold-archived {} old messages", cold_count)
+
+    def _append_raw_history(self, messages: list[dict], *, max_chars: int | None = None) -> None:
+        """Dump raw recent messages to history.jsonl without LLM summarization."""
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         formatted = truncate_text(self._format_messages(messages), limit)
         self.append_history(
             f"[RAW] {len(messages)} messages\n"
             f"{formatted}"
         )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
+
+    def _split_raw_archive_chunks(self, messages: list[dict]) -> Iterator[tuple[bool, list[dict]]]:
+        current_is_cold: bool | None = None
+        current: list[dict] = []
+        for message in messages:
+            is_cold = self._is_cold_archive_message(message)
+            if current and is_cold != current_is_cold:
+                yield bool(current_is_cold), current
+                current = []
+            current_is_cold = is_cold
+            current.append(message)
+        if current:
+            yield bool(current_is_cold), current
+
+    def _is_cold_archive_message(self, message: dict) -> bool:
+        if self.cold_archive_older_than_days <= 0:
+            return False
+        timestamp = self._parse_message_timestamp(message.get("timestamp"))
+        if timestamp is None:
+            return False
+        cutoff = datetime.now() - timedelta(days=self.cold_archive_older_than_days)
+        return timestamp < cutoff
+
+    @staticmethod
+    def _parse_message_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        raw = value.strip()
+        with suppress(ValueError):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        for fmt, length in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16)):
+            with suppress(ValueError):
+                return datetime.strptime(raw[:length], fmt)
+        return None
+
+    def _write_cold_archive(self, messages: list[dict], *, max_chars: int | None = None) -> None:
+        limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
+        formatted = truncate_text(self._format_messages(messages), limit)
+        timestamps = [
+            ts for ts in (self._parse_message_timestamp(m.get("timestamp")) for m in messages)
+            if ts is not None
+        ]
+        first_ts = timestamps[0] if timestamps else datetime.now()
+        archive_path = self.cold_archive_dir / f"{first_ts.strftime('%Y-%m')}.jsonl"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "archived_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "message_count": len(messages),
+            "start_timestamp": timestamps[0].isoformat() if timestamps else None,
+            "end_timestamp": timestamps[-1].isoformat() if timestamps else None,
+            "content": f"[RAW-COLD] {len(messages)} messages\n{formatted}",
+        }
+        with open(archive_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 
@@ -713,7 +792,10 @@ class Dream:
     _MEMORY_FILE_MAX_CHARS = 32_000
     _SOUL_FILE_MAX_CHARS = 16_000
     _USER_FILE_MAX_CHARS = 16_000
+    _TOPIC_FILE_MAX_CHARS = 8_000
+    _TOPICS_TOTAL_MAX_CHARS = 32_000
     _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
+    _RUN_LOG_MAX_CHARS = 64_000
 
     def __init__(
         self,
@@ -724,10 +806,12 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        allow_topic_edits: bool = True,
     ):
         self.store = store
         self.provider = provider
         self.model = model
+        self.model_override: str | None = None
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
@@ -735,13 +819,19 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.allow_topic_edits = allow_topic_edits
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
         self.provider = provider
-        self.model = model
+        self.model = self.model_override or model
         self._runner.provider = provider
+
+    def set_model_override(self, model: str | None) -> None:
+        self.model_override = model or None
+        if self.model_override:
+            self.model = self.model_override
 
     # -- tool registry -------------------------------------------------------
 
@@ -848,10 +938,87 @@ class Dream:
             result += "\n"
         return result
 
+    def _read_topic_previews(self) -> str:
+        """Return bounded previews of memory/topics/*.md for Dream prompts."""
+        if not self.allow_topic_edits:
+            return ""
+        topics_dir = self.store.memory_dir / "topics"
+        if not topics_dir.exists():
+            return ""
+        sections: list[str] = []
+        total = 0
+        for path in sorted(topics_dir.glob("*.md")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(self.store.workspace).as_posix()
+            content = truncate_text(
+                path.read_text(encoding="utf-8", errors="replace") or "(empty)",
+                self._TOPIC_FILE_MAX_CHARS,
+            )
+            section = f"### {rel}\n{content}"
+            if sections and total + len(section) > self._TOPICS_TOTAL_MAX_CHARS:
+                sections.append("### (truncated)\nAdditional topic files omitted from prompt preview.")
+                break
+            sections.append(section)
+            total += len(section)
+        if not sections:
+            return ""
+        return "## Current memory/topics/*.md\n" + "\n\n".join(sections)
+
+    def _write_run_log(
+        self,
+        *,
+        started_at: datetime,
+        last_cursor: int,
+        batch: list[dict[str, Any]],
+        phase1_output: str | None,
+        phase2_output: str | None,
+        stop_reason: str,
+        tool_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Persist Dream phase outputs for local debugging and later review."""
+        if not batch:
+            return
+        try:
+            logs_dir = ensure_dir(self.store.memory_dir / "dream_logs")
+            end_cursor = batch[-1].get("cursor", "?")
+            stamp = started_at.strftime("%Y%m%d-%H%M%S")
+            path = logs_dir / f"{stamp}_cursor-{last_cursor}-to-{end_cursor}.md"
+            phase1 = truncate_text(phase1_output or "", self._RUN_LOG_MAX_CHARS)
+            phase2 = truncate_text(phase2_output or "", self._RUN_LOG_MAX_CHARS)
+            events = tool_events or []
+            event_lines = "\n".join(
+                "- {name} [{status}]: {detail}".format(
+                    name=event.get("name", "?"),
+                    status=event.get("status", "?"),
+                    detail=str(event.get("detail", "")).replace("\n", " ")[:500],
+                )
+                for event in events
+            ) or "(none)"
+            content = (
+                f"# Dream Run Log\n\n"
+                f"- started_at: {started_at.isoformat(timespec='seconds')}\n"
+                f"- cursor_range: {last_cursor} -> {end_cursor}\n"
+                f"- batch_size: {len(batch)}\n"
+                f"- stop_reason: {stop_reason}\n"
+                f"- tool_event_count: {len(events)}\n\n"
+                f"## Phase 1 Final Output\n\n"
+                f"```text\n{phase1}\n```\n\n"
+                f"## Phase 2 Final Output\n\n"
+                f"```text\n{phase2}\n```\n\n"
+                f"## Phase 2 Tool Events\n\n"
+                f"{event_lines}\n"
+            )
+            path.write_text(content, encoding="utf-8")
+            logger.debug("Dream run log written: {}", path)
+        except Exception:
+            logger.exception("Dream run log write failed")
+
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
+        started_at = datetime.now()
         last_cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
@@ -888,6 +1055,7 @@ class Dream:
         current_user = truncate_text(
             self.store.read_user() or "(empty)", self._USER_FILE_MAX_CHARS,
         )
+        current_topics = self._read_topic_previews()
 
         file_context = (
             f"## Current Date\n{current_date}\n\n"
@@ -895,6 +1063,8 @@ class Dream:
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
+        if current_topics:
+            file_context += f"\n\n{current_topics}"
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
         phase1_prompt = (
@@ -918,6 +1088,21 @@ class Dream:
                 tools=None,
                 tool_choice=None,
             )
+            if phase1_response.finish_reason == "error":
+                logger.warning(
+                    "Dream Phase 1 returned LLM error; cursor not advanced: {}",
+                    (phase1_response.content or "")[:300],
+                )
+                self._write_run_log(
+                    started_at=started_at,
+                    last_cursor=last_cursor,
+                    batch=batch,
+                    phase1_output=phase1_response.content or "",
+                    phase2_output="",
+                    stop_reason="phase1_error",
+                    tool_events=[],
+                )
+                return False
             analysis = phase1_response.content or ""
             logger.debug("Dream Phase 1 analysis ({} chars): {}", len(analysis), analysis[:500])
         except Exception:
@@ -966,6 +1151,16 @@ class Dream:
         except Exception:
             logger.exception("Dream Phase 2 failed")
             result = None
+
+        self._write_run_log(
+            started_at=started_at,
+            last_cursor=last_cursor,
+            batch=batch,
+            phase1_output=analysis,
+            phase2_output=(result.final_content if result else ""),
+            stop_reason=(result.stop_reason if result else "phase2_exception"),
+            tool_events=(result.tool_events if result else []),
+        )
 
         # Build changelog from tool events
         changelog: list[str] = []

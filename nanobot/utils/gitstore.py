@@ -49,6 +49,31 @@ class GitStore:
         self._workspace = workspace
         self._tracked_files = tracked_files
 
+    @staticmethod
+    def _has_glob(value: str) -> bool:
+        return any(ch in value for ch in "*?[")
+
+    def _expanded_tracked_files(self, *, include_unmatched: bool = False) -> list[str]:
+        """Return tracked files with glob patterns expanded against workspace."""
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for rel in self._tracked_files:
+            if self._has_glob(rel):
+                rel_matches = [
+                    path.relative_to(self._workspace).as_posix()
+                    for path in sorted(self._workspace.glob(rel))
+                    if path.is_file()
+                ]
+                if not rel_matches and include_unmatched:
+                    rel_matches = [rel]
+            else:
+                rel_matches = [rel]
+            for item in rel_matches:
+                if item not in seen:
+                    seen.add(item)
+                    expanded.append(item)
+        return expanded
+
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
         return (self._workspace / ".git").is_dir()
@@ -96,14 +121,19 @@ class GitStore:
 
             # Ensure tracked files exist (touch them if missing) so the initial
             # commit has something to track.
-            for rel in self._tracked_files:
+            for rel in self._expanded_tracked_files(include_unmatched=True):
+                if self._has_glob(rel):
+                    continue
                 p = self._workspace / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
                 if not p.exists():
                     p.write_text("", encoding="utf-8")
 
             # Initial commit
-            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
+            porcelain.add(
+                str(self._workspace),
+                paths=[".gitignore"] + self._expanded_tracked_files(),
+            )
             porcelain.commit(
                 str(self._workspace),
                 message=b"init: nanobot memory store",
@@ -136,7 +166,7 @@ class GitStore:
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
+            porcelain.add(str(self._workspace), paths=self._expanded_tracked_files())
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -198,7 +228,10 @@ class GitStore:
         for f in self._tracked_files:
             parent = str(Path(f).parent)
             if parent != ".":
-                dirs.add(parent)
+                current = ""
+                for part in Path(parent).parts:
+                    current = part if not current else f"{current}/{part}"
+                    dirs.add(current)
         lines = ["/*"]
         for d in sorted(dirs):
             lines.append(f"!{d}/")
@@ -353,7 +386,7 @@ class GitStore:
                 tree = repo[parent_obj.tree]
 
                 restored: list[str] = []
-                for filepath in self._tracked_files:
+                for filepath in self._expanded_tracked_files():
                     content = self._read_blob_from_tree(repo, tree, filepath)
                     if content is not None:
                         dest = self._workspace / filepath

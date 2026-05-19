@@ -44,9 +44,17 @@ def _get_tool_hint_card(mock_send):
     return json.loads(content)
 
 
+def _get_tool_hint_markdown(card):
+    panel = card["elements"][0]
+    assert panel["tag"] == "collapsible_panel"
+    assert panel["background_color"] == "grey"
+    assert "工具调用详情" in panel["header"]["title"]["content"]
+    return panel["elements"][0]["content"]
+
+
 @mark.asyncio
 async def test_tool_hint_sends_interactive_card(mock_feishu_channel):
-    """Tool hint without active buffer sends an interactive card with 🔧 style."""
+    """Tool hint without active buffer sends a structured grey panel."""
     msg = OutboundMessage(
         channel="feishu",
         chat_id="oc_123456",
@@ -60,8 +68,8 @@ async def test_tool_hint_sends_interactive_card(mock_feishu_channel):
         assert mock_send.call_count == 1
         card = _get_tool_hint_card(mock_send)
         assert card["config"]["wide_screen_mode"] is True
-        md = card["elements"][0]["content"]
-        assert "\U0001f527" in md
+        md = _get_tool_hint_markdown(card)
+        assert "工具调用记录" in md
         assert "web_search" in md
 
 
@@ -102,7 +110,7 @@ async def test_tool_hint_without_metadata_sends_as_normal(mock_feishu_channel):
 
 @mark.asyncio
 async def test_tool_hint_multiple_tools_in_one_message(mock_feishu_channel):
-    """Multiple tool calls should each get the 🔧 prefix."""
+    """Multiple tool calls should stay visible in the structured panel."""
     msg = OutboundMessage(
         channel="feishu",
         chat_id="oc_123456",
@@ -114,10 +122,9 @@ async def test_tool_hint_multiple_tools_in_one_message(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert "web_search" in md
         assert "read_file" in md
-        assert "\U0001f527" in md
 
 
 @mark.asyncio
@@ -134,7 +141,7 @@ async def test_tool_hint_new_format_basic(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert "read src/main.py" in md
         assert 'grep "TODO"' in md
 
@@ -153,7 +160,7 @@ async def test_tool_hint_new_format_with_comma_in_quotes(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert 'grep "hello, world"' in md
         assert "$ echo test" in md
 
@@ -172,7 +179,7 @@ async def test_tool_hint_new_format_with_folding(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert "\u00d7 3" in md
         assert 'grep "pattern"' in md
 
@@ -191,7 +198,7 @@ async def test_tool_hint_new_format_mcp(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert "4_5v::analyze_image" in md
 
 
@@ -209,6 +216,6 @@ async def test_tool_hint_keeps_commas_inside_arguments(mock_feishu_channel):
         await mock_feishu_channel.send(msg)
 
         card = _get_tool_hint_card(mock_send)
-        md = card["elements"][0]["content"]
+        md = _get_tool_hint_markdown(card)
         assert 'web_search("foo, bar")' in md
         assert 'read_file("/path/to/file")' in md

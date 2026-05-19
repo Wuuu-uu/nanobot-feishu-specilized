@@ -69,6 +69,7 @@ class TestDreamRun:
         store.append_history("User prefers dark mode")
         mock_provider.chat_with_retry.return_value = MagicMock(content="New fact")
         mock_runner.run = AsyncMock(return_value=_make_run_result(
+            final_content="Updated memory/MEMORY.md because of New fact.",
             tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
         ))
         result = await dream.run()
@@ -77,6 +78,93 @@ class TestDreamRun:
         spec = mock_runner.run.call_args[0][0]
         assert spec.max_iterations == 10
         assert spec.fail_on_tool_error is False
+
+    async def test_run_log_records_phase_outputs_and_tool_events(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("User prefers dark mode")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[MEMORY] User prefers dark mode",
+            finish_reason="stop",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            final_content="Updated memory/MEMORY.md: User prefers dark mode.",
+            tool_events=[{"name": "edit_file", "status": "ok", "detail": "memory/MEMORY.md"}],
+        ))
+
+        assert await dream.run() is True
+
+        logs = sorted((store.memory_dir / "dream_logs").glob("*.md"))
+        assert len(logs) == 1
+        text = logs[0].read_text(encoding="utf-8")
+        assert "## Phase 1 Final Output" in text
+        assert "[MEMORY] User prefers dark mode" in text
+        assert "## Phase 2 Final Output" in text
+        assert "Updated memory/MEMORY.md" in text
+        assert "- edit_file [ok]: memory/MEMORY.md" in text
+
+    async def test_phase1_error_writes_run_log_without_advancing_cursor(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("event 1")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Error calling LLM: Request timed out.",
+            finish_reason="error",
+        )
+
+        assert await dream.run() is False
+
+        assert store.get_last_dream_cursor() == 0
+        logs = sorted((store.memory_dir / "dream_logs").glob("*.md"))
+        assert len(logs) == 1
+        text = logs[0].read_text(encoding="utf-8")
+        assert "stop_reason: phase1_error" in text
+        assert "Request timed out" in text
+
+    async def test_topics_are_included_when_enabled(self, dream, mock_provider, mock_runner, store):
+        topics_dir = store.memory_dir / "topics"
+        topics_dir.mkdir(parents=True)
+        (topics_dir / "se-workflow.md").write_text("# SE workflow\n- Collect traces", encoding="utf-8")
+        store.append_history("Discussed trace pipeline.")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="No updates.", finish_reason="stop")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        assert await dream.run() is True
+
+        phase1_user = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        phase2_user = mock_runner.run.call_args.args[0].initial_messages[1]["content"]
+        assert "memory/topics/se-workflow.md" in phase1_user
+        assert "Collect traces" in phase1_user
+        assert "memory/topics/se-workflow.md" in phase2_user
+
+    async def test_topics_are_omitted_when_disabled(self, dream, mock_provider, mock_runner, store):
+        dream.allow_topic_edits = False
+        topics_dir = store.memory_dir / "topics"
+        topics_dir.mkdir(parents=True)
+        (topics_dir / "se-workflow.md").write_text("# SE workflow", encoding="utf-8")
+        store.append_history("Discussed trace pipeline.")
+        mock_provider.chat_with_retry.return_value = MagicMock(content="No updates.", finish_reason="stop")
+        mock_runner.run = AsyncMock(return_value=_make_run_result())
+
+        assert await dream.run() is True
+
+        phase1_user = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert "memory/topics/se-workflow.md" not in phase1_user
+
+    async def test_phase1_error_does_not_run_phase2_or_advance_cursor(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("event 1")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Error calling LLM: Request timed out.",
+            finish_reason="error",
+        )
+
+        result = await dream.run()
+
+        assert result is False
+        assert store.get_last_dream_cursor() == 0
+        mock_runner.run.assert_not_called()
 
     async def test_advances_dream_cursor(self, dream, mock_provider, mock_runner, store):
         """Dream should advance the cursor after processing."""
@@ -306,4 +394,3 @@ class TestDreamPromptCaps:
         user_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
         history_section = user_msg.split("## Conversation History\n")[1].split("\n\n## Current Date")[0]
         assert len(history_section) < dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS + 500
-

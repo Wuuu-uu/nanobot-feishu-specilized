@@ -76,9 +76,14 @@ class TestSessionTTLConfig:
         assert "sessionTtlMinutes" not in data
 
     def test_session_file_cap_is_internal_constant(self):
-        """Session file cap should remain an internal constant, not a config field."""
+        """Legacy hard cap remains only as a fallback default."""
         from nanobot.session.manager import FILE_MAX_MESSAGES
         assert FILE_MAX_MESSAGES == 2000
+
+    def test_session_archive_buffer_default(self):
+        """Runtime file cap should be configurable relative to maxMessages."""
+        defaults = AgentDefaults()
+        assert defaults.session_archive_buffer_messages == 80
 
 
 class TestAgentLoopTTLParam:
@@ -93,6 +98,22 @@ class TestAgentLoopTTLParam:
         """AutoCompact default TTL should be 0 (disabled)."""
         loop = _make_loop(tmp_path, session_ttl_minutes=0)
         assert loop.auto_compact._ttl == 0
+
+    def test_loop_file_cap_uses_max_messages_plus_buffer(self, tmp_path):
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.generation.max_tokens = 4096
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            max_messages=25,
+            session_archive_buffer_messages=7,
+        )
+
+        assert loop._session_file_cap == 32
 
     @pytest.mark.asyncio
     async def test_process_message_reads_history_with_token_budget(self, tmp_path):

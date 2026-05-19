@@ -85,6 +85,10 @@ class Nanobot:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
+            max_messages=defaults.max_messages,
+            session_archive_buffer_messages=defaults.session_archive_buffer_messages,
+            dream_cold_archive_older_than_days=defaults.dream.cold_archive_older_than_days,
+            dream_allow_topic_edits=defaults.dream.allow_topic_edits,
             tools_config=config.tools,
         )
         return cls(loop)
