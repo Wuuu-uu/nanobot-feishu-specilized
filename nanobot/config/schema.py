@@ -1,9 +1,11 @@
 """Configuration schema using Pydantic."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -70,10 +72,45 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class InlineFallbackConfig(Base):
+    """One inline fallback model configuration."""
+
+    model: str
+    provider: str
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    temperature: float | None = None
+    reasoning_effort: str | None = None
+
+
+FallbackCandidate = str | InlineFallbackConfig
+
+
+class ModelPresetConfig(Base):
+    """A named set of model + generation parameters for quick switching."""
+
+    model: str
+    provider: str = "auto"
+    max_tokens: int = 8192
+    context_window_tokens: int = 65_536
+    temperature: float = 0.1
+    reasoning_effort: str | None = None
+
+    def to_generation_settings(self) -> Any:
+        from nanobot.providers.base import GenerationSettings
+
+        return GenerationSettings(
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = "~/.nanobot/workspace"
+    model_preset: str | None = None  # Active preset name — takes precedence over fields below
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -82,11 +119,22 @@ class AgentDefaults(Base):
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
     temperature: float = 0.1
+    fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
+    max_concurrent_subagents: int = Field(default=1, ge=1)
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
+    tool_hint_max_length: int = Field(
+        default=40,
+        ge=20,
+        le=500,
+        validation_alias=AliasChoices("toolHintMaxLength"),
+        serialization_alias="toolHintMaxLength",
+    )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    bot_name: str = "nanobot"  # Display name shown in CLI prompts
+    bot_icon: str = "🐈"  # Short icon shown next to bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
@@ -145,6 +193,7 @@ class ProvidersConfig(Base):
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
     huggingface: ProviderConfig = Field(default_factory=ProviderConfig)
+    skywork: ProviderConfig = Field(default_factory=ProviderConfig)  # Skywork / APIFree API gateway
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -152,6 +201,7 @@ class ProvidersConfig(Base):
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     lm_studio: ProviderConfig = Field(default_factory=ProviderConfig)  # LM Studio local models
+    atomic_chat: ProviderConfig = Field(default_factory=ProviderConfig)  # Atomic Chat local models
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -161,6 +211,7 @@ class ProvidersConfig(Base):
     stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)  # Xiaomi MIMO (小米)
     longcat: ProviderConfig = Field(default_factory=ProviderConfig)  # LongCat
+    ant_ling: ProviderConfig = Field(default_factory=ProviderConfig)  # Ant Ling
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
@@ -170,6 +221,7 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
+    nvidia: ProviderConfig = Field(default_factory=ProviderConfig)  # NVIDIA NIM (nvapi- keys)
 
 
 class HeartbeatConfig(Base):
@@ -380,6 +432,43 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    model_presets: dict[str, ModelPresetConfig] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("modelPresets", "model_presets"),
+    )
+
+    @model_validator(mode="after")
+    def _validate_model_preset(self) -> "Config":
+        if "default" in self.model_presets:
+            raise ValueError("model_preset name 'default' is reserved for agents.defaults")
+        name = self.agents.defaults.model_preset
+        if name and name != "default" and name not in self.model_presets:
+            raise ValueError(f"model_preset {name!r} not found in model_presets")
+        for fallback in self.agents.defaults.fallback_models:
+            if isinstance(fallback, str) and fallback not in self.model_presets:
+                raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+        return self
+
+    def resolve_default_preset(self) -> ModelPresetConfig:
+        """Return the implicit `default` preset from agents.defaults fields."""
+        d = self.agents.defaults
+        return ModelPresetConfig(
+            model=d.model,
+            provider=d.provider,
+            max_tokens=d.max_tokens,
+            context_window_tokens=d.context_window_tokens,
+            temperature=d.temperature,
+            reasoning_effort=d.reasoning_effort,
+        )
+
+    def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
+        """Return effective model params from a named preset or the implicit default."""
+        name = self.agents.defaults.model_preset if name is None else name
+        if not name or name == "default":
+            return self.resolve_default_preset()
+        if name not in self.model_presets:
+            raise KeyError(f"model_preset {name!r} not found in model_presets")
+        return self.model_presets[name]
 
     @property
     def workspace_path(self) -> Path:
@@ -387,12 +476,16 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
 
     def _match_provider(
-        self, model: str | None = None
+        self,
+        model: str | None = None,
+        *,
+        preset: ModelPresetConfig | None = None,
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS, find_by_name
 
-        forced = self.agents.defaults.provider
+        resolved = preset or self.resolve_preset()
+        forced = resolved.provider
         if forced != "auto":
             spec = find_by_name(forced)
             if spec:
@@ -400,7 +493,7 @@ class Config(BaseSettings):
                 return (p, spec.name) if p else (None, None)
             return None, None
 
-        model_lower = (model or self.agents.defaults.model).lower()
+        model_lower = (model or resolved.model).lower()
         model_normalized = model_lower.replace("-", "_")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
@@ -451,26 +544,46 @@ class Config(BaseSettings):
                 return p, spec.name
         return None, None
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+    def get_provider(
+        self,
+        model: str | None = None,
+        *,
+        preset: ModelPresetConfig | None = None,
+    ) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
+        p, _ = self._match_provider(model, preset=preset)
         return p
 
-    def get_provider_name(self, model: str | None = None) -> str | None:
+    def get_provider_name(
+        self,
+        model: str | None = None,
+        *,
+        preset: ModelPresetConfig | None = None,
+    ) -> str | None:
         """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
+        _, name = self._match_provider(model, preset=preset)
         return name
 
-    def get_api_key(self, model: str | None = None) -> str | None:
+    def get_api_key(
+        self,
+        model: str | None = None,
+        *,
+        preset: ModelPresetConfig | None = None,
+    ) -> str | None:
         """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
+        p = self.get_provider(model, preset=preset)
         return p.api_key if p else None
 
-    def get_api_base(self, model: str | None = None) -> str | None:
+    def get_api_base(
+        self,
+        model: str | None = None,
+        *,
+        preset: ModelPresetConfig | None = None,
+    ) -> str | None:
         """Get API base URL for the given model, falling back to the provider default when present."""
         from nanobot.providers.registry import find_by_name
 
-        p, name = self._match_provider(model)
+        p, name = self._match_provider(model, preset=preset)
         if p and p.api_base:
             return p.api_base
         if name:

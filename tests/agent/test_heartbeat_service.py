@@ -170,8 +170,8 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> None:
-    """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=silent -> on_notify NOT called."""
+async def test_tick_delivers_even_when_evaluator_would_say_no(tmp_path, monkeypatch) -> None:
+    """Deliverable heartbeat completions notify directly without evaluator false negatives."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
 
     provider = DummyProvider([
@@ -206,13 +206,13 @@ async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> 
     )
 
     async def _eval_silent(*a, **kw):
-        return False
+        raise AssertionError("heartbeat should not call evaluate_response")
 
     monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval_silent)
 
     await service._tick()
     assert executed == ["check status"]
-    assert notified == []
+    assert notified == ["everything is fine, no issues"]
 
 
 @pytest.mark.asyncio
@@ -286,4 +286,3 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
     user_msg = captured_messages[1]
     assert user_msg["role"] == "user"
     assert "Current Time:" in user_msg["content"]
-

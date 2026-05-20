@@ -5,6 +5,7 @@ strategy, and sandbox behaviour per platform — without actually running
 platform-specific binaries (all subprocess calls are mocked).
 """
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, patch
 
@@ -27,7 +28,7 @@ class TestBuildEnvUnix:
     def test_expected_keys(self):
         with patch("nanobot.agent.tools.shell._IS_WINDOWS", False):
             env = ExecTool()._build_env()
-        expected = {"HOME", "LANG", "TERM"}
+        expected = {"HOME", "LANG", "TERM", "PYTHONUNBUFFERED"}
         assert expected <= set(env)
         if sys.platform != "win32":
             assert set(env) == expected
@@ -53,7 +54,7 @@ class TestBuildEnvWindows:
 
     _EXPECTED_KEYS = {
         "SYSTEMROOT", "COMSPEC", "USERPROFILE", "HOMEDRIVE",
-        "HOMEPATH", "TEMP", "TMP", "PATHEXT", "PATH",
+        "HOMEPATH", "TEMP", "TMP", "PATHEXT", "PATH", "PYTHONUNBUFFERED",
         *_WINDOWS_ENV_KEYS,
     }
 
@@ -108,6 +109,9 @@ class TestSpawnUnix:
         assert "-c" in args
         assert "echo hi" in args
 
+        kwargs = mock_exec.call_args[1]
+        assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+
 
 class TestSpawnWindows:
 
@@ -123,6 +127,9 @@ class TestSpawnWindows:
 
         args = mock_shell.call_args[0]
         assert "dir" in args
+
+        kwargs = mock_shell.call_args[1]
+        assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
 
     @pytest.mark.asyncio
     async def test_passes_cwd_and_env(self):
@@ -268,6 +275,57 @@ class TestExecuteEndToEnd:
 
         assert "hello world" in result
         assert "Exit code: 0" in result
+
+
+# ---------------------------------------------------------------------------
+# _extract_absolute_paths - UNC path support
+# ---------------------------------------------------------------------------
+
+class TestExtractAbsolutePaths:
+    """Tests for Windows UNC path extraction in shell commands."""
+
+    def test_windows_drive_path(self):
+        cmd = r"dir C:\Users\Public"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert r"C:\Users\Public" in paths
+
+    def test_windows_drive_path_root(self):
+        cmd = r"dir C:\temp"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert any("C:\\" in p for p in paths)
+
+    def test_unc_path_simple(self):
+        cmd = r"dir \\server\share"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert r"\\server\share" in paths
+
+    def test_unc_path_with_subdirs(self):
+        cmd = r"copy \\server\share\folder\file.txt D:\backup"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert r"\\server\share\folder\file.txt" in paths
+        assert r"D:\backup" in paths
+
+    def test_unc_path_in_quotes(self):
+        cmd = r'type "\\server\share\docs\readme.txt"'
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert r"\\server\share\docs\readme.txt" in paths
+
+    def test_mixed_paths(self):
+        cmd = r"copy \\server\data\file.txt C:\local\temp && ls /tmp"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert r"\\server\data\file.txt" in paths
+        assert any("C:\\" in p for p in paths)
+        assert "/tmp" in paths
+
+    def test_home_path(self):
+        cmd = "cat ~/config.txt"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert "~/config.txt" in paths
+
+    def test_no_paths(self):
+        cmd = "echo hello"
+        paths = ExecTool._extract_absolute_paths(cmd)
+        assert paths == []
 
     @pytest.mark.asyncio
     async def test_unix_full_path(self):

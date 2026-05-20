@@ -20,6 +20,21 @@ FINISH_REASON_MAP = {
 }
 
 
+def _safe_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
 def map_finish_reason(status: str | None) -> str:
     """Map a Responses API status string to a Chat-Completions-style finish_reason."""
     return FINISH_REASON_MAP.get(status or "completed", "stop")
@@ -295,15 +310,19 @@ async def consume_sdk_stream(
                     input_details = getattr(usage_obj, "input_tokens_details", None)
                     output_details = getattr(usage_obj, "output_tokens_details", None)
                     usage = {
-                        "prompt_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                        "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                        "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+                        "prompt_tokens": _safe_int(getattr(usage_obj, "input_tokens", 0)),
+                        "completion_tokens": _safe_int(getattr(usage_obj, "output_tokens", 0)),
+                        "total_tokens": _safe_int(getattr(usage_obj, "total_tokens", 0)),
                     }
-                    cached = int(getattr(input_details, "cached_tokens", 0) or 0) if input_details else 0
+                    cached = (
+                        _safe_int(getattr(input_details, "cached_tokens", 0))
+                        if input_details
+                        else 0
+                    )
                     if cached:
                         usage["cached_tokens"] = cached
                     reasoning = (
-                        int(getattr(output_details, "reasoning_tokens", 0) or 0)
+                        _safe_int(getattr(output_details, "reasoning_tokens", 0))
                         if output_details
                         else 0
                     )

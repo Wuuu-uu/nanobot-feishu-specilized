@@ -13,7 +13,6 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.tools.ask import AskUserInterrupt
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.helpers import (
@@ -47,7 +46,7 @@ _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset({
-    "read_file", "exec", "grep", "glob",
+    "read_file", "exec", "grep",
     "web_search", "web_fetch", "list_dir",
 })
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
@@ -289,9 +288,6 @@ class AgentRunner:
 
             if response.should_execute_tools:
                 tool_calls = list(response.tool_calls)
-                ask_index = next((i for i, tc in enumerate(tool_calls) if tc.name == "ask_user"), None)
-                if ask_index is not None:
-                    tool_calls = tool_calls[: ask_index + 1]
                 context.tool_calls = list(tool_calls)
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
@@ -329,8 +325,6 @@ class AgentRunner:
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(tool_calls, results):
-                    if isinstance(fatal_error, AskUserInterrupt) and tool_call.name == "ask_user":
-                        continue
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -345,15 +339,6 @@ class AgentRunner:
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
                 if fatal_error is not None:
-                    if isinstance(fatal_error, AskUserInterrupt):
-                        final_content = fatal_error.question
-                        stop_reason = "ask_user"
-                        context.final_content = final_content
-                        context.stop_reason = stop_reason
-                        if hook.wants_streaming():
-                            await hook.on_stream_end(context, resuming=False)
-                        await hook.after_iteration(context)
-                        break
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
                     stop_reason = "tool_error"
@@ -728,11 +713,6 @@ class AgentRunner:
                     )
                     tool_results.append(result)
                     batch_results.append(result)
-                    if isinstance(result[2], AskUserInterrupt):
-                        break
-            if any(isinstance(error, AskUserInterrupt) for _, _, error in batch_results):
-                break
-
         results: list[Any] = []
         events: list[dict[str, str]] = []
         fatal_error: BaseException | None = None
@@ -805,9 +785,6 @@ class AgentRunner:
                 "status": "error",
                 "detail": str(exc),
             }
-            if isinstance(exc, AskUserInterrupt):
-                event["status"] = "waiting"
-                return "", event, exc
             payload = f"Error: {type(exc).__name__}: {exc}"
             handled = self._classify_violation(
                 raw_text=str(exc),

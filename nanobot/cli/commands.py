@@ -461,6 +461,23 @@ def _make_provider(config: Config):
         raise typer.Exit(1) from exc
 
 
+def _provider_snapshot_or_legacy(config: Config):
+    """Build a provider snapshot, preserving legacy test hooks around _make_provider."""
+    from nanobot.providers.factory import ProviderSnapshot, build_provider_snapshot, provider_signature
+
+    try:
+        return build_provider_snapshot(config)
+    except ValueError:
+        provider = _make_provider(config)
+        resolved = config.resolve_preset()
+        return ProviderSnapshot(
+            provider=provider,
+            model=resolved.model,
+            context_window_tokens=resolved.context_window_tokens,
+            signature=provider_signature(config),
+        )
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
@@ -539,8 +556,10 @@ def serve(
 
     from loguru import logger
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent import model_presets as preset_helpers
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.providers.factory import build_provider_snapshot
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -555,18 +574,25 @@ def serve(
     timeout = timeout if timeout is not None else api_cfg.timeout
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(runtime_config)
+    try:
+        provider_snapshot = build_provider_snapshot(runtime_config)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    provider = provider_snapshot.provider
     session_manager = SessionManager(runtime_config.workspace_path)
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=runtime_config.workspace_path,
-        model=runtime_config.agents.defaults.model,
+        model=provider_snapshot.model,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
-        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        context_window_tokens=provider_snapshot.context_window_tokens,
         context_block_limit=runtime_config.agents.defaults.context_block_limit,
         max_tool_result_chars=runtime_config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=runtime_config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=runtime_config.agents.defaults.tool_hint_max_length,
+        max_concurrent_subagents=runtime_config.agents.defaults.max_concurrent_subagents,
         web_config=runtime_config.tools.web,
         exec_config=runtime_config.tools.exec,
         restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
@@ -583,9 +609,12 @@ def serve(
         dream_cold_archive_older_than_days=runtime_config.agents.defaults.dream.cold_archive_older_than_days,
         dream_allow_topic_edits=runtime_config.agents.defaults.dream.allow_topic_edits,
         tools_config=runtime_config.tools,
+        provider_signature=provider_snapshot.signature,
+        model_presets=preset_helpers.configured_model_presets(runtime_config),
+        model_preset=runtime_config.agents.defaults.model_preset or "default",
     )
 
-    model_name = runtime_config.agents.defaults.model
+    model_name = provider_snapshot.model
     console.print(f"{__logo__} Starting OpenAI-compatible API server")
     console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/v1/chat/completions")
     console.print(f"  [cyan]Model[/cyan]    : {model_name}")
@@ -641,6 +670,7 @@ def _run_gateway(
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent import model_presets as preset_helpers
     from nanobot.agent.tools.cron import CronTool
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
@@ -684,6 +714,8 @@ def _run_gateway(
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
+        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -702,6 +734,9 @@ def _run_gateway(
         tools_config=config.tools,
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
+        model_presets=preset_helpers.configured_model_presets(config),
+        model_preset=config.agents.defaults.model_preset or "default",
+        preset_snapshot_loader=lambda name: load_provider_snapshot(preset_name=name),
     )
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
@@ -981,12 +1016,17 @@ def _run_gateway(
             await server.serve_forever()
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
-    agent.dream.set_model_override(dream_cfg.model_override)
-    agent.dream.max_batch_size = dream_cfg.max_batch_size
-    agent.dream.max_iterations = dream_cfg.max_iterations
-    agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
-    agent.dream.allow_topic_edits = dream_cfg.allow_topic_edits
-    agent.context.memory.cold_archive_older_than_days = dream_cfg.cold_archive_older_than_days
+    dream = getattr(agent, "dream", None)
+    if dream is not None:
+        if hasattr(dream, "set_model_override"):
+            dream.set_model_override(dream_cfg.model_override)
+        dream.max_batch_size = dream_cfg.max_batch_size
+        dream.max_iterations = dream_cfg.max_iterations
+        dream.annotate_line_ages = dream_cfg.annotate_line_ages
+        dream.allow_topic_edits = dream_cfg.allow_topic_edits
+    memory = getattr(getattr(agent, "context", None), "memory", None)
+    if memory is not None:
+        memory.cold_archive_older_than_days = dream_cfg.cold_archive_older_than_days
     from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
@@ -1071,6 +1111,7 @@ def agent(
     """Interact with the agent directly."""
     from loguru import logger
 
+    from nanobot.agent import model_presets as preset_helpers
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
@@ -1079,7 +1120,8 @@ def agent(
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
-    provider = _make_provider(config)
+    provider_snapshot = _provider_snapshot_or_legacy(config)
+    provider = provider_snapshot.provider
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -1098,13 +1140,15 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=provider_snapshot.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        context_window_tokens=provider_snapshot.context_window_tokens,
         web_config=config.tools.web,
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
+        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1120,6 +1164,9 @@ def agent(
         dream_cold_archive_older_than_days=config.agents.defaults.dream.cold_archive_older_than_days,
         dream_allow_topic_edits=config.agents.defaults.dream.allow_topic_edits,
         tools_config=config.tools,
+        provider_signature=provider_snapshot.signature,
+        model_presets=preset_helpers.configured_model_presets(config),
+        model_preset=config.agents.defaults.model_preset or "default",
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

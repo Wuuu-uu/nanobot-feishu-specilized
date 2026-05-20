@@ -98,6 +98,10 @@ def _fake_chat_stream(text: str = "ok"):
     return _stream()
 
 
+async def _append_delta(deltas: list[str], delta: str) -> None:
+    deltas.append(delta)
+
+
 class _FakeResponsesError(Exception):
     def __init__(self, status_code: int, text: str):
         super().__init__(text)
@@ -129,27 +133,28 @@ def test_gemma_routes_to_gemini_provider() -> None:
     assert "gemma" in spec.keywords
 
 
-def test_openrouter_sets_default_attribution_headers() -> None:
+async def test_openrouter_sets_default_attribution_headers() -> None:
     spec = find_by_name("openrouter")
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
-        OpenAICompatProvider(
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_cls:
+        provider = OpenAICompatProvider(
             api_key="sk-or-test-key",
             api_base="https://openrouter.ai/api/v1",
             default_model="anthropic/claude-sonnet-4-5",
             spec=spec,
         )
+        await provider._ensure_client()
 
-    headers = MockClient.call_args.kwargs["default_headers"]
+    headers = mock_client_cls.call_args.kwargs["default_headers"]
     assert headers["HTTP-Referer"] == "https://github.com/HKUDS/nanobot"
     assert headers["X-OpenRouter-Title"] == "nanobot"
     assert headers["X-OpenRouter-Categories"] == "cli-agent,personal-agent"
     assert "x-session-affinity" in headers
 
 
-def test_openrouter_user_headers_override_default_attribution() -> None:
+async def test_openrouter_user_headers_override_default_attribution() -> None:
     spec = find_by_name("openrouter")
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
-        OpenAICompatProvider(
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_client_cls:
+        provider = OpenAICompatProvider(
             api_key="sk-or-test-key",
             api_base="https://openrouter.ai/api/v1",
             default_model="anthropic/claude-sonnet-4-5",
@@ -160,8 +165,9 @@ def test_openrouter_user_headers_override_default_attribution() -> None:
             },
             spec=spec,
         )
+        await provider._ensure_client()
 
-    headers = MockClient.call_args.kwargs["default_headers"]
+    headers = mock_client_cls.call_args.kwargs["default_headers"]
     assert headers["HTTP-Referer"] == "https://nanobot.ai"
     assert headers["X-OpenRouter-Title"] == "Nanobot Pro"
     assert headers["X-OpenRouter-Categories"] == "cli-agent,personal-agent"
@@ -551,6 +557,75 @@ async def test_direct_openai_stream_responses_unsupported_param_falls_back() -> 
     assert result.content == "fallback stream"
     mock_responses.assert_awaited_once()
     mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_direct_openai_stream_responses_create_timeout_falls_back_to_non_streaming() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response("should not use chat"))
+    mock_responses = AsyncMock(
+        side_effect=[
+            TimeoutError("request timed out"),
+            _fake_responses_response("fallback response"),
+        ]
+    )
+    deltas: list[str] = []
+    spec = find_by_name("openai")
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        client_instance = MockClient.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="gpt-5-chat",
+            spec=spec,
+        )
+        result = await provider.chat_stream(
+            messages=[{"role": "user", "content": "hello"}],
+            model="gpt-5-chat",
+            on_content_delta=lambda delta: _append_delta(deltas, delta),
+        )
+
+    assert result.content == "fallback response"
+    assert deltas == ["fallback response"]
+    assert mock_responses.await_count == 2
+    mock_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_openai_stream_responses_idle_timeout_falls_back_to_non_streaming(monkeypatch) -> None:
+    monkeypatch.setenv("NANOBOT_STREAM_IDLE_TIMEOUT_S", "0")
+    mock_chat = AsyncMock(return_value=_fake_chat_response("should not use chat"))
+    mock_responses = AsyncMock(
+        side_effect=[
+            _StalledStream(),
+            _fake_responses_response("fallback response"),
+        ]
+    )
+    deltas: list[str] = []
+    spec = find_by_name("openai")
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        client_instance = MockClient.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="gpt-5-chat",
+            spec=spec,
+        )
+        result = await provider.chat_stream(
+            messages=[{"role": "user", "content": "hello"}],
+            model="gpt-5-chat",
+            on_content_delta=lambda delta: _append_delta(deltas, delta),
+        )
+
+    assert result.content == "fallback response"
+    assert deltas == ["fallback response"]
+    assert mock_responses.await_count == 2
+    mock_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio

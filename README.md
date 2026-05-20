@@ -27,7 +27,7 @@
 - **2026-04-28** 🌐 Olostep web search, Hugging Face provider, safer workspace-tool interruptions.
 - **2026-04-27** 💬 `/history` command, smarter session replay caps, smoother Discord / Slack threads.
 - **2026-04-26** 🧭 Natural cron reminders, thread-aware restarts, safer local provider and shell behavior.
-- **2026-04-25** 🧩 `ask_user` choices, macOS LaunchAgent deployment, MSTeams stale-reference cleanup.
+- **2026-04-25** 🧩 Choice buttons, macOS LaunchAgent deployment, MSTeams stale-reference cleanup.
 - **2026-04-24** 🎥 Video attachments for channels, DeepSeek thinking control, faster document startup.
 - **2026-04-23** 🧵 Discord thread sessions, Telegram inline buttons, structured tool progress updates.
 - **2026-04-22** 🔎 GitHub Copilot GPT-5 / o-series support, configurable web fetch, WebUI image uploads.

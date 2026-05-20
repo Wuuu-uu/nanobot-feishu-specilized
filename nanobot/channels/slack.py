@@ -472,7 +472,7 @@ class SlackChannel(BaseChannel):
         return preview.startswith(_HTML_DOWNLOAD_PREFIXES)
 
     async def _on_block_action(self, client: SocketModeClient, req: SocketModeRequest) -> None:
-        """Handle button clicks from ask_user blocks."""
+        """Handle button clicks from outbound message blocks."""
         await client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
         payload = req.payload or {}
         actions = payload.get("actions") or []
@@ -569,7 +569,7 @@ class SlackChannel(BaseChannel):
 
     @staticmethod
     def _build_button_blocks(text: str, buttons: list[list[str]]) -> list[dict[str, Any]]:
-        """Build Slack Block Kit blocks with action buttons for ask_user choices."""
+        """Build Slack Block Kit blocks with action buttons for outbound messages."""
         blocks: list[dict[str, Any]] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}},
         ]
@@ -580,7 +580,7 @@ class SlackChannel(BaseChannel):
                     "type": "button",
                     "text": {"type": "plain_text", "text": label[:75]},
                     "value": label[:75],
-                    "action_id": f"ask_user_{label[:50]}",
+                    "action_id": f"message_{label[:50]}",
                 })
         if elements:
             blocks.append({"type": "actions", "elements": elements[:25]})

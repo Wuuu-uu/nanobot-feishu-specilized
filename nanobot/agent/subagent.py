@@ -14,13 +14,15 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.image_generate import ImageGenerateTool
+from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.search import GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import AgentDefaults, ExecToolConfig, WebToolsConfig
+from nanobot.config.schema import AgentDefaults, ExecToolConfig, ToolsConfig, WebToolsConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.utils.prompt_templates import render_template
 
@@ -82,12 +84,16 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
+        tools_config: "ToolsConfig | None" = None,
+        max_concurrent_subagents: int | None = None,
     ):
+        defaults = AgentDefaults()
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.web_config = web_config or WebToolsConfig()
+        self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -95,7 +101,12 @@ class SubagentManager:
         self.max_iterations = (
             max_iterations
             if max_iterations is not None
-            else AgentDefaults().max_tool_iterations
+            else defaults.max_tool_iterations
+        )
+        self.max_concurrent_subagents = (
+            max_concurrent_subagents
+            if max_concurrent_subagents is not None
+            else defaults.max_concurrent_subagents
         )
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -178,7 +189,6 @@ class SubagentManager:
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
-            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
             tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir, file_states=file_states))
             if self.exec_config.enable:
                 tools.register(ExecTool(
@@ -206,6 +216,27 @@ class SubagentManager:
                         user_agent=self.web_config.user_agent,
                     )
                 )
+            tools.register(
+                MessageTool(
+                    send_callback=self.bus.publish_outbound,
+                    default_channel=origin.get("channel") or "cli",
+                    default_chat_id=origin.get("chat_id") or "direct",
+                    workspace=self.workspace,
+                )
+            )
+            image_cfg = self.tools_config.image_gen
+            if image_cfg.enabled and image_cfg.api_base and image_cfg.api_key and image_cfg.model_name:
+                image_tool = ImageGenerateTool(
+                    config=image_cfg,
+                    workspace=self.workspace,
+                    allowed_dir=allowed_dir,
+                    send_callback=self.bus.publish_outbound,
+                )
+                image_tool.set_context(
+                    origin.get("channel") or "cli",
+                    origin.get("chat_id") or "direct",
+                )
+                tools.register(image_tool)
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},

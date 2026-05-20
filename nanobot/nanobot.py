@@ -62,7 +62,11 @@ class Nanobot:
                 Path(workspace).expanduser().resolve()
             )
 
-        provider = _make_provider(config)
+        from nanobot.agent import model_presets as preset_helpers
+        from nanobot.providers.factory import build_provider_snapshot
+
+        provider_snapshot = build_provider_snapshot(config)
+        provider = provider_snapshot.provider
         bus = MessageBus()
         defaults = config.agents.defaults
 
@@ -70,12 +74,14 @@ class Nanobot:
             bus=bus,
             provider=provider,
             workspace=config.workspace_path,
-            model=defaults.model,
+            model=provider_snapshot.model,
             max_iterations=defaults.max_tool_iterations,
-            context_window_tokens=defaults.context_window_tokens,
+            context_window_tokens=provider_snapshot.context_window_tokens,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,
+            tool_hint_max_length=defaults.tool_hint_max_length,
+            max_concurrent_subagents=defaults.max_concurrent_subagents,
             web_config=config.tools.web,
             exec_config=config.tools.exec,
             restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -90,6 +96,9 @@ class Nanobot:
             dream_cold_archive_older_than_days=defaults.dream.cold_archive_older_than_days,
             dream_allow_topic_edits=defaults.dream.allow_topic_edits,
             tools_config=config.tools,
+            provider_signature=provider_snapshot.signature,
+            model_presets=preset_helpers.configured_model_presets(config),
+            model_preset=defaults.model_preset or "default",
         )
         return cls(loop)
 

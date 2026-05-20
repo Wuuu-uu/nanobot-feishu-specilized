@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
@@ -20,14 +21,8 @@ from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.ask import (
-    AskUserTool,
-    ask_user_options_from_messages,
-    ask_user_outbound,
-    ask_user_tool_result_messages,
-    pending_ask_user_id,
-)
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.filesystem import (
     AppendFileTool,
@@ -37,13 +32,14 @@ from nanobot.agent.tools.filesystem import (
     WriteFileTool,
 )
 from nanobot.agent.tools.image_generate import ImageGenerateTool
+from nanobot.agent.tools.long_task import CompleteGoalTool, LongTaskTool
 from nanobot.agent.tools.memory_search import MemorySearchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notion import NotionTool
 from nanobot.agent.tools.pdf_mineru import MineruPdfParseTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
+from nanobot.agent.tools.search import GrepTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.session_manage import SessionManageTool
 from nanobot.agent.tools.shell import ExecTool
@@ -52,9 +48,10 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults
+from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.session.goal_state import runner_wall_llm_timeout_s
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
@@ -240,6 +237,8 @@ class AgentLoop:
         context_block_limit: int | None = None,
         max_tool_result_chars: int | None = None,
         provider_retry_mode: str = "standard",
+        tool_hint_max_length: int | None = None,
+        max_concurrent_subagents: int | None = None,
         web_config: WebToolsConfig | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
@@ -258,8 +257,11 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
-        provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
+        provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        model_presets: dict[str, ModelPresetConfig] | None = None,
+        model_preset: str | None = None,
+        preset_snapshot_loader: Callable[[str], ProviderSnapshot] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -269,7 +271,13 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
+        self._preset_snapshot_loader = preset_snapshot_loader
         self._provider_signature = provider_signature
+        self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
+        self._active_preset: str | None = None
+        self._default_selection_signature = preset_helpers.default_selection_signature(
+            provider_signature,
+        )
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -287,6 +295,11 @@ class AgentLoop:
             else defaults.max_tool_result_chars
         )
         self.provider_retry_mode = provider_retry_mode
+        self.tool_hint_max_length = (
+            tool_hint_max_length
+            if tool_hint_max_length is not None
+            else defaults.tool_hint_max_length
+        )
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.tools_config = _tc
@@ -314,6 +327,10 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
+            tools_config=self.tools_config,
+            max_concurrent_subagents=max_concurrent_subagents
+            if max_concurrent_subagents is not None
+            else defaults.max_concurrent_subagents,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -367,17 +384,27 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        if model_preset:
+            self._active_preset = model_preset
 
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
 
-    def _apply_provider_snapshot(self, snapshot: ProviderSnapshot) -> None:
+    def _apply_provider_snapshot(
+        self,
+        snapshot: ProviderSnapshot,
+        *,
+        model_preset: str | None = None,
+    ) -> None:
         """Swap model/provider for future turns without disturbing an active one."""
         provider = snapshot.provider
         model = snapshot.model
         context_window_tokens = snapshot.context_window_tokens
         if self.provider is provider and self.model == model:
+            if model_preset is not None:
+                self._active_preset = model_preset
+            self._provider_signature = snapshot.signature
             return
         old_model = self.model
         self.provider = provider
@@ -388,6 +415,8 @@ class AgentLoop:
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature
+        if model_preset is not None:
+            self._active_preset = model_preset
         logger.info("Runtime model switched for next turn: {} -> {}", old_model, model)
 
     def _refresh_provider_snapshot(self) -> None:
@@ -398,9 +427,43 @@ class AgentLoop:
         except Exception:
             logger.exception("Failed to refresh provider config")
             return
+        default_selection = preset_helpers.default_selection_signature(snapshot.signature)
+        if self._active_preset and self._default_selection_signature in (None, default_selection):
+            self._default_selection_signature = default_selection
+            try:
+                snapshot = self._build_model_preset_snapshot(self._active_preset)
+            except Exception:
+                logger.exception("Failed to refresh active model preset")
+                return
+        else:
+            self._active_preset = None
+            self._default_selection_signature = default_selection
         if snapshot.signature == self._provider_signature:
             return
+        self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
         self._apply_provider_snapshot(snapshot)
+
+    @property
+    def model_preset(self) -> str | None:
+        return self._active_preset
+
+    @model_preset.setter
+    def model_preset(self, name: str | None) -> None:
+        self.set_model_preset(name)
+
+    def _build_model_preset_snapshot(self, name: str) -> ProviderSnapshot:
+        return preset_helpers.build_runtime_preset_snapshot(
+            name=name,
+            presets=self.model_presets,
+            provider=self.provider,
+            loader=self._preset_snapshot_loader,
+        )
+
+    def set_model_preset(self, name: str | None) -> None:
+        """Resolve a preset by name and apply all runtime model dependents."""
+        name = preset_helpers.normalize_preset_name(name, self.model_presets)
+        snapshot = self._build_model_preset_snapshot(name)
+        self._apply_provider_snapshot(snapshot, model_preset=name)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -409,7 +472,6 @@ class AgentLoop:
             self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
         )
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-        self.tools.register(AskUserTool())
         self.tools.register(
             ReadFileTool(
                 workspace=self.workspace,
@@ -420,8 +482,7 @@ class AgentLoop:
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(AppendFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        for cls in (GlobTool, GrepTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
         if self.exec_config.enable:
             self.tools.register(
@@ -472,6 +533,8 @@ class AgentLoop:
         if _tc.memory_system.enabled:
             self.tools.register(MemorySearchTool(workspace=self.workspace, config=_tc.memory_system))
         self.tools.register(SessionManageTool(manager=self.sessions))
+        self.tools.register(LongTaskTool(sessions=self.sessions, bus=self.bus))
+        self.tools.register(CompleteGoalTool(sessions=self.sessions, bus=self.bus))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(
@@ -516,10 +579,22 @@ class AgentLoop:
             effective_key = UNIFIED_SESSION_KEY
         else:
             effective_key = f"{channel}:{chat_id}"
-        for name in ("message", "spawn", "cron", "my", "image_generate", "session_manage"):
+        request_ctx = RequestContext(
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=effective_key,
+            metadata=metadata or {},
+        )
+        for name in (
+            "message", "spawn", "cron", "my", "image_generate",
+            "session_manage", "long_task", "complete_goal",
+        ):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name == "spawn":
+                    if name in {"long_task", "complete_goal"}:
+                        tool.set_context(request_ctx)
+                    elif name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
                         if hasattr(tool, "set_origin_message_id"):
                             tool.set_origin_message_id(message_id)
@@ -544,12 +619,11 @@ class AgentLoop:
         """Return the chat id shown in runtime metadata for the model."""
         return str(msg.metadata.get("context_chat_id") or msg.chat_id)
 
-    @staticmethod
-    def _tool_hint(tool_calls: list) -> str:
+    def _tool_hint(self, tool_calls: list) -> str:
         """Format tool calls as concise hints with smart abbreviation."""
         from nanobot.utils.tool_hints import format_tool_hints
 
-        return format_tool_hints(tool_calls)
+        return format_tool_hints(tool_calls, max_length=self.tool_hint_max_length)
 
     async def _dispatch_command_inline(
         self,
@@ -731,6 +805,11 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                llm_timeout_s=runner_wall_llm_timeout_s(
+                    self.sessions,
+                    session.key if session is not None else session_key,
+                    metadata=(session.metadata if session is not None else None),
+                ),
             ))
         finally:
             reset_file_states(file_state_token)
@@ -1026,6 +1105,7 @@ class AgentLoop:
                 session_summary=pending,
                 current_role=current_role,
                 sender_id=msg.sender_id,
+                session_metadata=session.metadata,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -1042,12 +1122,6 @@ class AgentLoop:
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
-            options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
-            content, buttons = ask_user_outbound(
-                final_content or "Background task completed.",
-                options,
-                channel,
-            )
             # Reconstruct channel-specific metadata from session.key so the
             # outbound reply lands in the originating thread (not the channel
             # top-level). The announce InboundMessage carries only
@@ -1061,8 +1135,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
-                content=content,
-                buttons=buttons,
+                content=final_content or "Background task completed.",
                 metadata=outbound_metadata,
             )
 
@@ -1110,24 +1183,16 @@ class AgentLoop:
         }
         history = session.get_history(**_hist_kwargs)
 
-        pending_ask_id = pending_ask_user_id(history)
-        if pending_ask_id:
-            initial_messages = ask_user_tool_result_messages(
-                self.context.build_system_prompt(channel=msg.channel),
-                history,
-                pending_ask_id,
-                msg.content,
-            )
-        else:
-            initial_messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content,
-                session_summary=pending,
-                media=msg.media if msg.media else None,
-                channel=msg.channel,
-                chat_id=self._runtime_chat_id(msg),
-                sender_id=msg.sender_id,
-            )
+        initial_messages = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            session_summary=pending,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=self._runtime_chat_id(msg),
+            sender_id=msg.sender_id,
+            session_metadata=session.metadata,
+        )
 
         async def _bus_progress(
             content: str,
@@ -1168,7 +1233,7 @@ class AgentLoop:
         user_persisted_early = False
         media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(msg.content, str) and msg.content.strip()
-        if not pending_ask_id and (has_text or media_paths):
+        if has_text or media_paths:
             extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
@@ -1220,19 +1285,13 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        final_content, buttons = ask_user_outbound(
-            final_content,
-            ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else [],
-            msg.channel,
-        )
-        if on_stream is not None and stop_reason not in {"ask_user", "error", "tool_error"}:
+        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
             metadata=meta,
-            buttons=buttons,
         )
 
     def _sanitize_persisted_blocks(

@@ -269,12 +269,10 @@ _STREAM_SEGMENT_SEPARATOR = "\n\n---\n\n"
 _EMPTY_TOOL_LOGS_MARKDOWN = "**工具调用记录**\n\n暂无工具调用。"
 
 _TOOL_DISPLAY_NAMES: dict[str, str] = {
-    "ask_user": "询问用户",
     "append_file": "追加文件",
     "cron": "定时任务",
     "edit_file": "编辑文件",
     "exec": "执行命令",
-    "glob": "匹配文件",
     "grep": "搜索文件",
     "image_generate": "图像生成",
     "list_dir": "列出目录",

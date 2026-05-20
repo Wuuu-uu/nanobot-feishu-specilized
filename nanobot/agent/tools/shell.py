@@ -111,7 +111,7 @@ class ExecTool(Tool):
         return (
             "Execute a shell command and return its output. "
             "Prefer read_file/write_file/edit_file over cat/echo/sed, "
-            "and grep/glob over shell find/grep. "
+            "and grep over shell find/grep. "
             "Use -y or --yes flags to avoid interactive prompts. "
             "Output is truncated at 10 000 chars; timeout defaults to 60s."
         )
@@ -226,6 +226,7 @@ class ExecTool(Tool):
             # the raw command string to COMSPEC without re-quoting.
             return await asyncio.create_subprocess_shell(
                 command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
@@ -234,6 +235,7 @@ class ExecTool(Tool):
         bash = shutil.which("bash") or "/bin/bash"
         return await asyncio.create_subprocess_exec(
             bash, "-l", "-c", command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
@@ -276,6 +278,7 @@ class ExecTool(Tool):
                 "TMP": os.environ.get("TMP", f"{sr}\\Temp"),
                 "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
                 "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
+                "PYTHONUNBUFFERED": "1",
                 "APPDATA": os.environ.get("APPDATA", ""),
                 "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
                 "ProgramData": os.environ.get("ProgramData", ""),
@@ -293,6 +296,7 @@ class ExecTool(Tool):
             "HOME": home,
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "dumb"),
+            "PYTHONUNBUFFERED": "1",
         }
         for key in self.allowed_env_keys:
             val = os.environ.get(key)
@@ -371,9 +375,12 @@ class ExecTool(Tool):
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
-        # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`
+        # Windows: match drive-root paths like `C:\`, paths, and UNC shares.
         # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
-        win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]*", command)
+        win_paths = re.findall(
+            r"(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
+            command,
+        )
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths

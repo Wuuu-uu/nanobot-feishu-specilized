@@ -10,14 +10,6 @@ This file documents non-obvious constraints and usage patterns.
 - Output is truncated at 10,000 characters
 - `restrictToWorkspace` config can limit file access to the workspace
 
-## glob — File Discovery
-
-- Use `glob` to find files by pattern before falling back to shell commands
-- Simple patterns like `*.py` match recursively by filename
-- Use `entry_type="dirs"` when you need matching directories instead of files
-- Use `head_limit` and `offset` to page through large result sets
-- Prefer this over `exec` when you only need file paths
-
 ## grep — Content Search
 
 - Use `grep` to search file contents inside the workspace
