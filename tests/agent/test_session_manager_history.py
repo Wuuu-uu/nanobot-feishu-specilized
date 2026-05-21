@@ -401,6 +401,69 @@ def test_get_history_recovers_user_when_token_slice_would_be_assistant_only(monk
     assert [m["content"] for m in history] == ["u2", "a2"]
 
 
+def test_get_history_token_first_not_limited_by_legacy_message_window():
+    session = Session(key="test:token-first-window")
+    for i in range(160):
+        session.messages.append({"role": "user", "content": f"u{i}"})
+        session.messages.append({"role": "assistant", "content": f"a{i}"})
+
+    history = session.get_history_token_first(max_tokens=100_000)
+
+    assert len(history) == 320
+    assert history[0]["content"] == "u0"
+
+
+def test_get_history_token_first_respects_token_budget_and_user_boundary(monkeypatch):
+    session = Session(key="test:token-first-budget")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+    )
+    token_map = {"u1": 50, "a1": 50, "u2": 50, "a2": 50, "u3": 50, "a3": 50}
+    monkeypatch.setattr(
+        "nanobot.session.manager.estimate_message_tokens",
+        lambda message: token_map.get(message.get("content"), 0),
+    )
+
+    history = session.get_history_token_first(max_tokens=120)
+
+    assert [m["content"] for m in history] == ["u3", "a3"]
+
+
+def test_get_history_token_first_keeps_legal_tool_boundary(monkeypatch):
+    session = Session(key="test:token-first-tools")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "u1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "old result"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    monkeypatch.setattr(
+        "nanobot.session.manager.estimate_message_tokens",
+        lambda message: 80 if message.get("content") == "old result" else 10,
+    )
+
+    history = session.get_history_token_first(max_tokens=40)
+
+    assert [m["role"] for m in history] == ["user", "assistant"]
+    assert [m["content"] for m in history] == ["u2", "done"]
+
+
 def test_retain_recent_legal_suffix_hard_cap_with_long_non_user_chain():
     session = Session(key="test:hard-cap-chain")
     session.messages.append({"role": "user", "content": "u0"})

@@ -54,9 +54,9 @@ def _session_with_turns(loop: AgentLoop, *, turns: int):
 @pytest.mark.parametrize(
     ("ratio", "context_window_tokens", "estimates", "expected_archives"),
     [
-        (0.5, 200, [250, 90], 1),
+        (0.5, 200, [250, 40], 1),
         (0.1, 1000, [1200, 800, 400, 50], 2),
-        (0.9, 200, [300, 175], 1),
+        (0.9, 200, [300, 80], 1),
     ],
 )
 async def test_consolidation_ratio_controls_target(

@@ -2031,10 +2031,13 @@ async def test_microcompact_replaces_old_tool_results():
     result = AgentRunner._microcompact(messages)
     tool_msgs = [m for m in result if m.get("role") == "tool"]
     stale_count = total - _MICROCOMPACT_KEEP_RECENT
-    compacted = [m for m in tool_msgs if "omitted from context" in str(m.get("content", ""))]
+    compacted = [m for m in tool_msgs if "compacted from active context" in str(m.get("content", ""))]
     preserved = [m for m in tool_msgs if m.get("content") == long_content]
     assert len(compacted) == stale_count
     assert len(preserved) == _MICROCOMPACT_KEEP_RECENT
+    assert "tool_call_id: c0" in compacted[0]["content"]
+    assert "arguments: {}" in compacted[0]["content"]
+    assert "re-run the tool" in compacted[0]["content"]
 
 
 @pytest.mark.asyncio

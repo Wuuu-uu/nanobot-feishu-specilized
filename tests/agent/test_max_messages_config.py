@@ -1,4 +1,4 @@
-"""Tests for max_messages config wiring into session history replay."""
+"""Tests for legacy max_messages compatibility and token-first replay."""
 
 from __future__ import annotations
 
@@ -90,11 +90,10 @@ class TestGetHistoryWithMaxMessages:
 
 
 class TestMaxMessagesIntegration:
-    """Verify the config flows from AgentLoop into get_history calls."""
+    """Verify active replay is token-first and max_messages is only a safety cap."""
 
     @pytest.mark.asyncio
-    async def test_process_message_passes_config_to_history_call(self, tmp_path: Path) -> None:
-        """The real message path should pass max_messages into session history replay."""
+    async def test_process_message_uses_token_first_replay(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, max_messages=25)
         loop.provider.chat_with_retry = AsyncMock(
             return_value=LLMResponse(content="ok", tool_calls=[], usage={})
@@ -103,18 +102,20 @@ class TestMaxMessagesIntegration:
         loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
         session = loop.sessions.get_or_create("cli:test")
-        with patch.object(session, "get_history", wraps=session.get_history) as mock_hist:
+        with patch.object(session, "get_history_token_first", wraps=session.get_history_token_first) as mock_hist:
             result = await loop._process_message(
                 InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
             )
 
         assert result is not None
         assert mock_hist.call_count == 1
-        assert mock_hist.call_args.kwargs["max_messages"] == 25
+        assert "max_messages" not in mock_hist.call_args.kwargs
+        assert mock_hist.call_args.kwargs["safety_message_cap"] == 1000
+        assert mock_hist.call_args.kwargs["max_tokens"] > 0
 
     @pytest.mark.asyncio
-    async def test_zero_config_passes_builtin_limit_to_history_call(self, tmp_path: Path) -> None:
-        loop = _make_loop(tmp_path, max_messages=0)
+    async def test_large_max_messages_can_raise_safety_cap(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path, max_messages=1500)
         loop.provider.chat_with_retry = AsyncMock(
             return_value=LLMResponse(content="ok", tool_calls=[], usage={})
         )
@@ -122,13 +123,13 @@ class TestMaxMessagesIntegration:
         loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
         session = loop.sessions.get_or_create("cli:test")
-        with patch.object(session, "get_history", wraps=session.get_history) as mock_hist:
+        with patch.object(session, "get_history_token_first", wraps=session.get_history_token_first) as mock_hist:
             result = await loop._process_message(
                 InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
             )
 
         assert result is not None
-        assert mock_hist.call_args.kwargs["max_messages"] == DEFAULT_MAX_MESSAGES
+        assert mock_hist.call_args.kwargs["safety_message_cap"] == 1500
 
 
 class TestSchemaConfig:

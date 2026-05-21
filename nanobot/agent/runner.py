@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -1111,9 +1112,25 @@ class AgentRunner:
 
     @staticmethod
     def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace old compactable tool results with one-line summaries."""
+        """Replace old compactable tool results with lightweight references."""
         compactable_indices: list[int] = []
+        tool_call_meta: dict[str, dict[str, str]] = {}
         for idx, msg in enumerate(messages):
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict) or not tc.get("id"):
+                        continue
+                    func = tc.get("function")
+                    if not isinstance(func, dict):
+                        continue
+                    args = func.get("arguments")
+                    if not isinstance(args, str):
+                        with suppress(Exception):
+                            args = json.dumps(args, ensure_ascii=False)
+                    tool_call_meta[str(tc["id"])] = {
+                        "name": str(func.get("name") or ""),
+                        "arguments": str(args or ""),
+                    }
             if msg.get("role") == "tool" and msg.get("name") in _COMPACTABLE_TOOLS:
                 compactable_indices.append(idx)
 
@@ -1127,13 +1144,40 @@ class AgentRunner:
             content = msg.get("content")
             if not isinstance(content, str) or len(content) < _MICROCOMPACT_MIN_CHARS:
                 continue
-            name = msg.get("name", "tool")
-            summary = f"[{name} result omitted from context]"
+            name = str(msg.get("name") or "tool")
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            summary = AgentRunner._tool_result_compaction_summary(
+                name,
+                tool_call_id,
+                content,
+                tool_call_meta.get(tool_call_id, {}),
+            )
             if updated is None:
                 updated = [dict(m) for m in messages]
             updated[idx]["content"] = summary
 
         return updated if updated is not None else messages
+
+    @staticmethod
+    def _tool_result_compaction_summary(
+        tool_name: str,
+        tool_call_id: str,
+        content: str,
+        meta: dict[str, str],
+    ) -> str:
+        lines = [f"[{tool_name} result compacted from active context]"]
+        if tool_call_id:
+            lines.append(f"tool_call_id: {tool_call_id}")
+        arguments = (meta.get("arguments") or "").strip()
+        if arguments:
+            lines.append(f"arguments: {truncate_text(arguments, 500)}")
+        for prefix in ("Full output saved to:", "Original size:"):
+            for line in content.splitlines():
+                if line.startswith(prefix):
+                    lines.append(line)
+                    break
+        lines.append("note: re-run the tool or read the persisted output if exact content is needed.")
+        return "\n".join(lines)
 
     def _apply_tool_result_budget(
         self,

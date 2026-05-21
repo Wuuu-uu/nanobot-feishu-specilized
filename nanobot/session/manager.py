@@ -72,6 +72,72 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    def _history_entry(
+        self,
+        message: dict[str, Any],
+        *,
+        include_timestamps: bool = False,
+    ) -> dict[str, Any]:
+        content = message.get("content", "")
+        # Synthesize an ``[image: path]`` breadcrumb from the persisted
+        # ``media`` kwarg so LLM replay still sees *something* where the
+        # image used to be. Without this, an image-only user turn replays as
+        # an empty user message.
+        media = message.get("media")
+        if isinstance(media, list) and media and isinstance(content, str):
+            breadcrumbs = "\n".join(
+                image_placeholder_text(p) for p in media if isinstance(p, str) and p
+            )
+            content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+        if include_timestamps:
+            content = self._annotate_message_time(message, content)
+
+        entry: dict[str, Any] = {"role": message["role"], "content": content}
+        for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            if key in message:
+                entry[key] = message[key]
+        return entry
+
+    @staticmethod
+    def _align_history_start(
+        raw_and_entries: list[tuple[dict[str, Any], dict[str, Any]]],
+        full_raw_and_entries: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Start replay at a user turn and keep tool-call boundaries legal."""
+        if not raw_and_entries:
+            return []
+
+        first_user = next(
+            (i for i, (raw, _entry) in enumerate(raw_and_entries) if raw.get("role") == "user"),
+            None,
+        )
+        if first_user is not None:
+            start = first_user
+            if first_user > 0 and raw_and_entries[first_user - 1][0].get("_channel_delivery"):
+                start = first_user - 1
+            raw_and_entries = raw_and_entries[start:]
+        elif full_raw_and_entries:
+            # Tight token budgets can otherwise leave assistant-only tails.
+            # Recover the nearest preceding user turn even if that slightly
+            # exceeds the target budget, because provider-valid context is
+            # more important than a perfectly tight estimate.
+            recovered_user = next(
+                (
+                    i
+                    for i in range(len(full_raw_and_entries) - 1, -1, -1)
+                    if full_raw_and_entries[i][0].get("role") == "user"
+                ),
+                None,
+            )
+            if recovered_user is not None:
+                raw_and_entries = full_raw_and_entries[recovered_user:]
+
+        entries = [entry for _raw, entry in raw_and_entries]
+        start = find_legal_message_start(entries)
+        if start:
+            raw_and_entries = raw_and_entries[start:]
+        return raw_and_entries
+
     def get_history(
         self,
         max_messages: int = 120,
@@ -103,27 +169,7 @@ class Session:
         if start:
             sliced = sliced[start:]
 
-        out: list[dict[str, Any]] = []
-        for message in sliced:
-            content = message.get("content", "")
-            # Synthesize an ``[image: path]`` breadcrumb from the persisted
-            # ``media`` kwarg so LLM replay still sees *something* where the
-            # image used to be. Without this, an image-only user turn
-            # replays as an empty user message — the assistant's reply then
-            # looks like it's responding to nothing.
-            media = message.get("media")
-            if isinstance(media, list) and media and isinstance(content, str):
-                breadcrumbs = "\n".join(
-                    image_placeholder_text(p) for p in media if isinstance(p, str) and p
-                )
-                content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
-            if include_timestamps:
-                content = self._annotate_message_time(message, content)
-            entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
-                if key in message:
-                    entry[key] = message[key]
-            out.append(entry)
+        out = [self._history_entry(message, include_timestamps=include_timestamps) for message in sliced]
 
         if max_tokens > 0 and out:
             kept: list[dict[str, Any]] = []
@@ -157,6 +203,47 @@ class Session:
                 kept = kept[start:]
             out = kept
         return out
+
+    def get_history_token_first(
+        self,
+        *,
+        max_tokens: int,
+        include_timestamps: bool = False,
+        safety_message_cap: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Return unconsolidated messages for active context, token budget first.
+
+        Unlike ``get_history()``, this does not apply the legacy message-count
+        window before token selection. ``safety_message_cap`` is only a final
+        guardrail for pathological sessions, not the primary replay policy.
+        """
+        raw_messages = list(self.messages[self.last_consolidated:])
+        if not raw_messages:
+            return []
+
+        full = [
+            (message, self._history_entry(message, include_timestamps=include_timestamps))
+            for message in raw_messages
+        ]
+
+        if max_tokens > 0:
+            kept_reversed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            used = 0
+            for item in reversed(full):
+                tokens = estimate_message_tokens(item[1])
+                if kept_reversed and used + tokens > max_tokens:
+                    break
+                kept_reversed.append(item)
+                used += tokens
+            selected = list(reversed(kept_reversed))
+        else:
+            selected = list(full)
+
+        if safety_message_cap > 0 and len(selected) > safety_message_cap:
+            selected = selected[-safety_message_cap:]
+
+        selected = self._align_history_start(selected, full)
+        return [entry for _raw, entry in selected]
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

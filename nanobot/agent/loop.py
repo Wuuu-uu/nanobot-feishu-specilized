@@ -52,7 +52,7 @@ from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.goal_state import runner_wall_llm_timeout_s
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import FILE_MAX_MESSAGES, Session, SessionManager
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -334,7 +334,8 @@ class AgentLoop:
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
-        self._session_file_cap = self._max_messages + max(0, session_archive_buffer_messages)
+        self._history_safety_message_cap = max(self._max_messages, 1000)
+        self._session_file_cap = FILE_MAX_MESSAGES
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
@@ -671,11 +672,16 @@ class AgentLoop:
             return 0
         max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
         try:
-            reserved_output = int(max_output)
+            max_output_tokens = int(max_output)
         except (TypeError, ValueError):
-            reserved_output = 4096
-        budget = self.context_window_tokens - max(1, reserved_output) - 1024
-        return budget if budget > 0 else max(128, self.context_window_tokens // 2)
+            max_output_tokens = 4096
+        reserve_tokens = max(max_output_tokens + 4096, 16_384)
+        budget = self.context_window_tokens - reserve_tokens
+        if budget <= 0:
+            budget = max(128, self.context_window_tokens // 2)
+        if isinstance(self.context_block_limit, int) and self.context_block_limit > 0:
+            budget = min(budget, self.context_block_limit)
+        return max(128, budget)
 
     async def _run_agent_loop(
         self,
@@ -1088,11 +1094,11 @@ class AgentLoop:
                 msg.metadata, session_key=key,
             )
             _hist_kwargs: dict[str, Any] = {
-                "max_messages": self._max_messages,
                 "max_tokens": self._replay_token_budget(),
                 "include_timestamps": True,
+                "safety_message_cap": self._history_safety_message_cap,
             }
-            history = session.get_history(**_hist_kwargs)
+            history = session.get_history_token_first(**_hist_kwargs)
             current_role = "assistant" if is_subagent else "user"
 
             # Subagent content is already in `history` above; passing it again
@@ -1177,11 +1183,11 @@ class AgentLoop:
                 message_tool.start_turn()
 
         _hist_kwargs: dict[str, Any] = {
-            "max_messages": self._max_messages,
             "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
+            "safety_message_cap": self._history_safety_message_cap,
         }
-        history = session.get_history(**_hist_kwargs)
+        history = session.get_history_token_first(**_hist_kwargs)
 
         initial_messages = self.context.build_messages(
             history=history,

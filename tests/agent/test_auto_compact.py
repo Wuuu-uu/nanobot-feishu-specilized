@@ -99,7 +99,7 @@ class TestAgentLoopTTLParam:
         loop = _make_loop(tmp_path, session_ttl_minutes=0)
         assert loop.auto_compact._ttl == 0
 
-    def test_loop_file_cap_uses_max_messages_plus_buffer(self, tmp_path):
+    def test_loop_file_cap_uses_internal_file_limit(self, tmp_path):
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
@@ -113,14 +113,16 @@ class TestAgentLoopTTLParam:
             session_archive_buffer_messages=7,
         )
 
-        assert loop._session_file_cap == 32
+        from nanobot.session.manager import FILE_MAX_MESSAGES
+
+        assert loop._session_file_cap == FILE_MAX_MESSAGES
 
     @pytest.mark.asyncio
     async def test_process_message_reads_history_with_token_budget(self, tmp_path):
-        """_process_message should pass an auto-derived token budget to get_history."""
+        """_process_message should pass an auto-derived token budget to token-first replay."""
         loop = _make_loop(tmp_path)
         session = loop.sessions.get_or_create("cli:direct")
-        session.get_history = MagicMock(return_value=[])
+        session.get_history_token_first = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
         loop._run_agent_loop = AsyncMock(return_value=("ok", [], [], "stop", False))
         loop._save_turn = MagicMock()
@@ -132,11 +134,12 @@ class TestAgentLoopTTLParam:
             content="hello",
         )
         await loop._process_message(msg)
-        session.get_history.assert_called_once()
-        kwargs = session.get_history.call_args.kwargs
+        session.get_history_token_first.assert_called_once()
+        kwargs = session.get_history_token_first.call_args.kwargs
         assert isinstance(kwargs.get("max_tokens"), int)
         assert kwargs["max_tokens"] > 0
         assert kwargs["include_timestamps"] is True
+        assert kwargs["safety_message_cap"] >= 1000
 
     @pytest.mark.asyncio
     async def test_session_file_cap_archives_and_trims_old_messages(self, tmp_path):

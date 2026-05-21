@@ -564,20 +564,31 @@ class Consolidator:
         self,
         session: Session,
         tokens_to_remove: int,
+        *,
+        keep_recent_tokens: int = 0,
     ) -> tuple[int, int] | None:
         """Pick a user-turn boundary that removes enough old prompt tokens."""
         start = session.last_consolidated
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
 
+        total_tokens = 0
+        if keep_recent_tokens > 0:
+            total_tokens = sum(
+                estimate_message_tokens(message)
+                for message in session.messages[start:]
+            )
+
         removed_tokens = 0
         last_boundary: tuple[int, int] | None = None
         for idx in range(start, len(session.messages)):
             message = session.messages[idx]
             if idx > start and message.get("role") == "user":
-                last_boundary = (idx, removed_tokens)
-                if removed_tokens >= tokens_to_remove:
-                    return last_boundary
+                remaining_tokens = total_tokens - removed_tokens
+                if keep_recent_tokens <= 0 or remaining_tokens >= keep_recent_tokens:
+                    last_boundary = (idx, removed_tokens)
+                    if removed_tokens >= tokens_to_remove:
+                        return last_boundary
             removed_tokens += estimate_message_tokens(message)
 
         return last_boundary
@@ -588,8 +599,12 @@ class Consolidator:
         *,
         session_summary: str | None = None,
     ) -> tuple[int, str]:
-        """Estimate current prompt size for the normal session history view."""
-        history = session.get_history(max_messages=0, include_timestamps=True)
+        """Estimate current prompt size for the full unconsolidated backlog."""
+        history = session.get_history_token_first(
+            max_tokens=0,
+            include_timestamps=True,
+            safety_message_cap=0,
+        )
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         probe_messages = self._build_messages(
             history=history,
@@ -609,7 +624,14 @@ class Consolidator:
     @property
     def _input_token_budget(self) -> int:
         """Available input token budget for consolidation LLM."""
-        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        reserve_tokens = max(self.max_completion_tokens + 4096, 16_384)
+        budget = self.context_window_tokens - reserve_tokens
+        return budget if budget > 0 else max(128, self.context_window_tokens // 2)
+
+    @property
+    def _keep_recent_tokens(self) -> int:
+        budget = self._input_token_budget
+        return min(20_000, max(8_000, budget // 5))
 
     def _truncate_to_token_budget(self, text: str) -> str:
         """Truncate text so it fits within the consolidation LLM's token budget."""
@@ -705,7 +727,16 @@ class Consolidator:
                 if estimated <= target:
                     break
 
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+                boundary = self.pick_consolidation_boundary(
+                    session,
+                    max(1, estimated - target),
+                    keep_recent_tokens=self._keep_recent_tokens,
+                )
+                if boundary is None:
+                    boundary = self.pick_consolidation_boundary(
+                        session,
+                        max(1, estimated - target),
+                    )
                 if boundary is None:
                     logger.debug(
                         "Token consolidation: no safe boundary for {} (round {})",

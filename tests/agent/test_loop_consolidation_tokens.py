@@ -32,12 +32,32 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
 
 @pytest.mark.asyncio
 async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
-    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    loop = _make_loop(tmp_path, estimated_tokens=80, context_window_tokens=200)
     loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     await loop.process_direct("hello", session_key="cli:test")
 
     loop.consolidator.archive.assert_not_awaited()
+
+
+def test_estimate_session_prompt_tokens_uses_full_unconsolidated_history(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=65_536)
+    session = loop.sessions.get_or_create("cli:test")
+    for i in range(160):
+        session.add_message("user", f"u{i}")
+        session.add_message("assistant", f"a{i}")
+
+    captured: dict[str, int] = {}
+
+    def build_messages(**kwargs):
+        captured["history_len"] = len(kwargs["history"])
+        return [{"role": "system", "content": "sys"}, *kwargs["history"]]
+
+    loop.consolidator._build_messages = build_messages  # type: ignore[method-assign]
+
+    loop.consolidator.estimate_session_prompt_tokens(session)
+
+    assert captured["history_len"] == 320
 
 
 @pytest.mark.asyncio
@@ -105,10 +125,10 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
     def mock_estimate(_session, *, session_summary=None):
         call_count[0] += 1
         if call_count[0] == 1:
-            return (500, "test")
+            return (250, "test")
         if call_count[0] == 2:
-            return (300, "test")
-        return (80, "test")
+            return (150, "test")
+        return (40, "test")
 
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
@@ -116,7 +136,7 @@ async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> No
     await loop.consolidator.maybe_consolidate_by_tokens(session)
 
     assert loop.consolidator.archive.await_count == 2
-    assert session.last_consolidated == 6
+    assert session.last_consolidated == 4
 
 
 @pytest.mark.asyncio
@@ -142,10 +162,10 @@ async def test_consolidation_continues_below_trigger_until_half_target(tmp_path,
     def mock_estimate(_session, *, session_summary=None):
         call_count[0] += 1
         if call_count[0] == 1:
-            return (500, "test")
+            return (250, "test")
         if call_count[0] == 2:
-            return (150, "test")
-        return (80, "test")
+            return (80, "test")
+        return (40, "test")
 
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
     monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
@@ -153,7 +173,7 @@ async def test_consolidation_continues_below_trigger_until_half_target(tmp_path,
     await loop.consolidator.maybe_consolidate_by_tokens(session)
 
     assert loop.consolidator.archive.await_count == 2
-    assert session.last_consolidated == 6
+    assert session.last_consolidated == 4
 
 
 @pytest.mark.asyncio
