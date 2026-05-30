@@ -138,6 +138,46 @@ class Session:
             raw_and_entries = raw_and_entries[start:]
         return raw_and_entries
 
+    @staticmethod
+    def _align_indexed_history_start(
+        indexed_raw_and_entries: list[tuple[int, dict[str, Any], dict[str, Any]]],
+        full_indexed_raw_and_entries: list[tuple[int, dict[str, Any], dict[str, Any]]] | None = None,
+    ) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+        """Start indexed replay at a user turn and keep tool-call boundaries legal."""
+        if not indexed_raw_and_entries:
+            return []
+
+        first_user = next(
+            (
+                i
+                for i, (_idx, raw, _entry) in enumerate(indexed_raw_and_entries)
+                if raw.get("role") == "user"
+            ),
+            None,
+        )
+        if first_user is not None:
+            start = first_user
+            if first_user > 0 and indexed_raw_and_entries[first_user - 1][1].get("_channel_delivery"):
+                start = first_user - 1
+            indexed_raw_and_entries = indexed_raw_and_entries[start:]
+        elif full_indexed_raw_and_entries:
+            recovered_user = next(
+                (
+                    i
+                    for i in range(len(full_indexed_raw_and_entries) - 1, -1, -1)
+                    if full_indexed_raw_and_entries[i][1].get("role") == "user"
+                ),
+                None,
+            )
+            if recovered_user is not None:
+                indexed_raw_and_entries = full_indexed_raw_and_entries[recovered_user:]
+
+        entries = [entry for _idx, _raw, entry in indexed_raw_and_entries]
+        start = find_legal_message_start(entries)
+        if start:
+            indexed_raw_and_entries = indexed_raw_and_entries[start:]
+        return indexed_raw_and_entries
+
     def get_history(
         self,
         max_messages: int = 120,
@@ -217,20 +257,39 @@ class Session:
         window before token selection. ``safety_message_cap`` is only a final
         guardrail for pathological sessions, not the primary replay policy.
         """
-        raw_messages = list(self.messages[self.last_consolidated:])
-        if not raw_messages:
+        return [
+            entry
+            for _idx, entry in self.get_history_token_first_with_indexes(
+                max_tokens=max_tokens,
+                include_timestamps=include_timestamps,
+                safety_message_cap=safety_message_cap,
+            )
+        ]
+
+    def get_history_token_first_with_indexes(
+        self,
+        *,
+        max_tokens: int,
+        include_timestamps: bool = False,
+        safety_message_cap: int = 1000,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return token-first history entries with their raw session indexes."""
+        indexed_raw_messages = list(
+            enumerate(self.messages[self.last_consolidated:], start=self.last_consolidated)
+        )
+        if not indexed_raw_messages:
             return []
 
         full = [
-            (message, self._history_entry(message, include_timestamps=include_timestamps))
-            for message in raw_messages
+            (idx, message, self._history_entry(message, include_timestamps=include_timestamps))
+            for idx, message in indexed_raw_messages
         ]
 
         if max_tokens > 0:
-            kept_reversed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            kept_reversed: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
             used = 0
             for item in reversed(full):
-                tokens = estimate_message_tokens(item[1])
+                tokens = estimate_message_tokens(item[2])
                 if kept_reversed and used + tokens > max_tokens:
                     break
                 kept_reversed.append(item)
@@ -242,8 +301,8 @@ class Session:
         if safety_message_cap > 0 and len(selected) > safety_message_cap:
             selected = selected[-safety_message_cap:]
 
-        selected = self._align_history_start(selected, full)
-        return [entry for _raw, entry in selected]
+        selected = self._align_indexed_history_start(selected, full)
+        return [(idx, entry) for idx, _raw, entry in selected]
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

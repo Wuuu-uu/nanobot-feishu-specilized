@@ -6,6 +6,7 @@ import re
 import select
 import signal
 import sys
+import time
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
@@ -606,6 +607,7 @@ def serve(
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
         max_messages=runtime_config.agents.defaults.max_messages,
         session_archive_buffer_messages=runtime_config.agents.defaults.session_archive_buffer_messages,
+        active_context_archive_buffer_messages=runtime_config.agents.defaults.active_context_archive_buffer_messages,
         dream_cold_archive_older_than_days=runtime_config.agents.defaults.dream.cold_archive_older_than_days,
         dream_allow_topic_edits=runtime_config.agents.defaults.dream.allow_topic_edits,
         tools_config=runtime_config.tools,
@@ -679,6 +681,7 @@ def _run_gateway(
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
+    from nanobot.session.goal_state import GOAL_STATE_KEY, goal_state_raw, parse_goal_state
     from nanobot.session.manager import SessionManager
 
     port = port if port is not None else config.gateway.port
@@ -729,6 +732,7 @@ def _run_gateway(
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         max_messages=config.agents.defaults.max_messages,
         session_archive_buffer_messages=config.agents.defaults.session_archive_buffer_messages,
+        active_context_archive_buffer_messages=config.agents.defaults.active_context_archive_buffer_messages,
         dream_cold_archive_older_than_days=config.agents.defaults.dream.cold_archive_older_than_days,
         dream_allow_topic_edits=config.agents.defaults.dream.allow_topic_edits,
         tools_config=config.tools,
@@ -751,36 +755,112 @@ def _run_gateway(
 
     async def _deliver_to_channel(
         msg: OutboundMessage, *, record: bool = False, session_key: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """Publish a user-visible message and mirror it into that channel's session."""
         metadata = dict(msg.metadata or {})
         record = record or bool(metadata.pop("_record_channel_delivery", False))
+        record_session_key = metadata.pop("_record_session_key", None)
+        legacy_delivery_prefix = str(metadata.pop("_delivery_prefix", "") or "")
+        record_prefix = str(metadata.pop("_record_prefix", "") or legacy_delivery_prefix or "")
+        display_content = msg.content
+        record_content = msg.content
+        if record_prefix and record_content and not record_content.startswith(record_prefix):
+            record_content = record_prefix + record_content
         if metadata != (msg.metadata or {}):
             msg = OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content=msg.content,
+                content=display_content,
                 reply_to=msg.reply_to,
                 media=msg.media,
                 metadata=metadata,
                 buttons=msg.buttons,
             )
+        persisted_timestamp: str | None = None
         if (
             record
             and msg.channel != "cli"
-            and msg.content.strip()
+            and record_content.strip()
             and hasattr(session_manager, "get_or_create")
             and hasattr(session_manager, "save")
         ):
-            key = session_key or _channel_session_key(msg.channel, msg.chat_id)
+            key = session_key or record_session_key or _channel_session_key(msg.channel, msg.chat_id)
             session = session_manager.get_or_create(key)
-            session.add_message("assistant", msg.content, _channel_delivery=True)
+            extra: dict[str, object] = {"_channel_delivery": True}
+            if source_label := metadata.get("_source_label") or metadata.get("_cron_source_label"):
+                extra["_cron_source_label"] = str(source_label)
+            if source_session := metadata.get("_cron_source_session"):
+                extra["_cron_source_session"] = str(source_session)
+            session.add_message("assistant", record_content, **extra)
+            persisted_timestamp = str(session.messages[-1].get("timestamp") or "") or None
             session_manager.save(session)
         await bus.publish_outbound(msg)
+        return persisted_timestamp
 
     message_tool = getattr(agent, "tools", {}).get("message")
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(_deliver_to_channel)
+
+    def _session_rel_path(session_key: str) -> str:
+        return f"sessions/{session_manager.safe_key(session_key)}.jsonl"
+
+    def _ensure_cron_worker_goal(worker_key: str, job: CronJob) -> None:
+        session = session_manager.get_or_create(worker_key)
+        prior = parse_goal_state(goal_state_raw(session.metadata))
+        if isinstance(prior, dict) and prior.get("status") == "active":
+            return
+        from datetime import datetime
+
+        session.metadata[GOAL_STATE_KEY] = {
+            "status": "active",
+            "objective": job.payload.message.strip(),
+            "ui_summary": (job.name or "cron worker")[:120],
+            "started_at": datetime.now().isoformat(),
+            "source": "cron:agent_turn_with_context",
+        }
+        session_manager.save(session)
+
+    def _latest_cron_sync_timestamp(session_key: str, worker_rel: str) -> str | None:
+        if not session_manager.session_exists(session_key):
+            return None
+        session = session_manager.get_or_create(session_key)
+        legacy_prefix = f"[From Cron Agent Session: {worker_rel}]\n\n"
+        for message in reversed(session.messages):
+            content = message.get("content")
+            if (
+                message.get("role") == "assistant"
+                and message.get("timestamp")
+                and (
+                    message.get("_cron_source_session") == worker_rel
+                    or (isinstance(content, str) and content.startswith(legacy_prefix))
+                )
+            ):
+                return str(message["timestamp"])
+        return None
+
+    def _channel_streaming_enabled(channel_name: str, metadata: dict[str, object]) -> bool:
+        if metadata.get("_wants_stream") is True:
+            return True
+        try:
+            from nanobot.channels.base import BaseChannel
+            from nanobot.channels.registry import discover_all
+
+            channel_cls = discover_all().get(channel_name)
+            supports_streaming = (
+                channel_cls is not None and channel_cls.send_delta is not BaseChannel.send_delta
+            )
+            default_config = channel_cls.default_config() if channel_cls is not None else {}
+        except Exception:
+            supports_streaming = False
+            default_config = {}
+        section = getattr(config.channels, channel_name, None)
+        if section is None:
+            return False
+        if isinstance(section, dict):
+            streaming = section.get("streaming", default_config.get("streaming", False))
+        else:
+            streaming = getattr(section, "streaming", default_config.get("streaming", False))
+        return bool(streaming) and supports_streaming
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
@@ -821,7 +901,169 @@ def _run_gateway(
                     ),
                     record=True,
                     session_key=job.payload.session_key,
+            )
+            return response
+
+        if job.payload.kind == "agent_turn_with_context":
+            context_key = (
+                job.payload.context_session_key
+                or job.payload.session_key
+                or _channel_session_key(job.payload.channel or "cli", job.payload.to or "direct")
+            )
+            sync_key = job.payload.sync_session_key or context_key
+            worker_key = job.payload.worker_session_key or f"cron:{job.id}"
+            if worker_key in {context_key, sync_key}:
+                worker_key = f"cron:{job.id}"
+            job.payload.context_session_key = context_key
+            job.payload.sync_session_key = sync_key
+            job.payload.worker_session_key = worker_key
+
+            _ensure_cron_worker_goal(worker_key, job)
+            worker_rel = _session_rel_path(worker_key)
+            sync_record_prefix = f"[From Cron Agent Session: {worker_rel}]\n\n"
+            source_label = f"Cron · {worker_rel}"
+            pre_sync_timestamp = _latest_cron_sync_timestamp(sync_key, worker_rel)
+
+            autonomous_note = (
+                "[Autonomous Cron Agent Turn]\n"
+                "You are running in an independent cron worker session. Continue the scheduled "
+                "objective without waiting for a new user message.\n\n"
+                f"Worker session: {worker_key}\n"
+                f"Main context session: {context_key}\n"
+                f"Main sync session: {sync_key}\n"
+                "The main session is read-only for this turn except that your final user-facing "
+                "status will be appended there with a cron-session tag after delivery.\n"
+                "Do not call session_sync; main-session guidance is injected explicitly into this "
+                "worker session via cron_message when the user wants to steer the autonomous run.\n"
+                "When you need idea review, blocker diagnosis, experiment gating, strategy review, "
+                "or a human-escalation decision, call autopilot_help. That helper call is synchronous: "
+                "your cron turn waits for the helper response, and you must follow the returned decision "
+                "before continuing. If the helper returns decision: human_required, stop and report the pause.\n"
+                "Review recent worker-session guidance messages and any research state files named "
+                "by the scheduled objective before deciding the next action.\n"
+                "Do not create a new cron job from this cron execution. Only call message if you must "
+                "send an attachment or urgent mid-run alert; otherwise return the final progress update "
+                "as your normal assistant response.\n\n"
+                f"Scheduled objective:\n{job.payload.message}"
+            )
+
+            cron_tool = agent.tools.get("cron")
+            cron_token = None
+            if isinstance(cron_tool, CronTool):
+                cron_token = cron_tool.set_cron_context(True)
+
+            async def _cron_progress(
+                content: str,
+                *,
+                tool_hint: bool = False,
+                tool_events: list[dict[str, object]] | None = None,
+            ) -> None:
+                if not job.payload.to:
+                    return
+                if not config.channels.send_autonomous_progress:
+                    if not tool_events:
+                        return
+                    content = ""
+                meta = dict(job.payload.channel_meta)
+                meta["_progress"] = True
+                meta["_tool_hint"] = tool_hint
+                meta["_source_label"] = source_label
+                meta["_cron_source_session"] = worker_rel
+                if wants_stream:
+                    meta["_stream_id"] = stream_id
+                if tool_events:
+                    meta["_tool_events"] = tool_events
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=content,
+                        metadata=meta,
+                    )
                 )
+
+            message_record_token = None
+            if isinstance(message_tool, MessageTool):
+                message_record_token = message_tool.set_record_channel_delivery(True)
+
+            turn_metadata = dict(job.payload.channel_meta)
+            turn_metadata["_record_session_key"] = sync_key
+            turn_metadata["_record_prefix"] = sync_record_prefix
+            turn_metadata["_source_label"] = source_label
+            turn_metadata["_cron_source_session"] = worker_rel
+            turn_metadata["_autopilot_context_session_key"] = context_key
+            turn_metadata["_autopilot_sync_session_key"] = sync_key
+            turn_metadata["_autopilot_worker_session_key"] = worker_key
+            turn_metadata["_autopilot_job_id"] = job.id
+            turn_metadata["_autopilot_job_name"] = job.name
+            wants_stream = bool(
+                job.payload.to
+                and _channel_streaming_enabled(job.payload.channel or "cli", turn_metadata)
+            )
+            stream_id = f"{worker_key}:{job.id}:{int(time.time() * 1_000_000)}"
+
+            async def _cron_stream(delta: str) -> None:
+                meta = dict(turn_metadata)
+                meta["_stream_delta"] = True
+                meta["_stream_id"] = stream_id
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to or "direct",
+                        content=delta,
+                        metadata=meta,
+                    )
+                )
+
+            async def _cron_stream_end(*, resuming: bool = False) -> None:
+                meta = dict(turn_metadata)
+                meta["_stream_end"] = True
+                meta["_resuming"] = resuming
+                meta["_stream_id"] = stream_id
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to or "direct",
+                        content="",
+                        metadata=meta,
+                    )
+                )
+
+            try:
+                resp = await agent.process_direct(
+                    autonomous_note,
+                    session_key=worker_key,
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to or "direct",
+                    metadata=turn_metadata,
+                    on_progress=_cron_progress,
+                    on_stream=_cron_stream if wants_stream else None,
+                    on_stream_end=_cron_stream_end if wants_stream else None,
+                )
+            finally:
+                if isinstance(cron_tool, CronTool) and cron_token is not None:
+                    cron_tool.reset_cron_context(cron_token)
+                if isinstance(message_tool, MessageTool) and message_record_token is not None:
+                    message_tool.reset_record_channel_delivery(message_record_token)
+
+            response = resp.content if resp else ""
+            if job.payload.deliver and job.payload.to and response:
+                persisted_ts = await _deliver_to_channel(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=response,
+                        metadata={**turn_metadata, **(resp.metadata if resp else {})},
+                    ),
+                    record=True,
+                    session_key=sync_key,
+                )
+                if persisted_ts:
+                    job.payload.last_sync_message_timestamp = persisted_ts
+            elif job.payload.deliver and isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+                latest_ts = _latest_cron_sync_timestamp(sync_key, worker_rel)
+                if latest_ts and latest_ts != pre_sync_timestamp:
+                    job.payload.last_sync_message_timestamp = latest_ts
             return response
 
         reminder_note = (
@@ -1161,6 +1403,7 @@ def agent(
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         max_messages=config.agents.defaults.max_messages,
         session_archive_buffer_messages=config.agents.defaults.session_archive_buffer_messages,
+        active_context_archive_buffer_messages=config.agents.defaults.active_context_archive_buffer_messages,
         dream_cold_archive_older_than_days=config.agents.defaults.dream.cold_archive_older_than_days,
         dream_allow_topic_edits=config.agents.defaults.dream.allow_topic_edits,
         tools_config=config.tools,

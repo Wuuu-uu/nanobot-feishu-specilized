@@ -4,6 +4,7 @@ import pytest
 
 from nanobot.agent.loop import AgentLoop
 import nanobot.agent.memory as memory_module
+import nanobot.session.manager as session_module
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 
@@ -211,6 +212,69 @@ async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path,
     assert pending is not None
     assert "User discussed project status." in pending
     assert "_last_summary" not in reloaded.metadata
+
+
+@pytest.mark.asyncio
+async def test_active_context_buffer_archives_messages_outside_replay(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=80, context_window_tokens=200)
+    loop.consolidator.active_context_archive_buffer_messages = 2
+    loop.consolidator.archive = AsyncMock(return_value="should not be called")  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
+        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
+    ]
+    loop.sessions.save(session)
+    monkeypatch.setattr(session_module, "estimate_message_tokens", lambda _message: 60)
+
+    await loop.consolidator.maybe_archive_active_context_buffer(
+        session,
+        max_tokens=100,
+        safety_message_cap=1000,
+    )
+
+    loop.consolidator.archive.assert_not_awaited()
+    history_entries = loop.context.memory.read_unprocessed_history(0)
+    assert len(history_entries) == 1
+    content = history_entries[0]["content"]
+    assert content.startswith("[RAW-ACTIVE-CONTEXT] 4 messages")
+    assert "USER: u1" in content
+    assert "ASSISTANT: a1" in content
+    assert "USER: u2" in content
+    assert "ASSISTANT: a2" in content
+    assert session.last_consolidated == 4
+    assert "_last_summary" not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_active_context_buffer_waits_until_message_threshold(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=80, context_window_tokens=200)
+    loop.consolidator.active_context_archive_buffer_messages = 5
+    loop.consolidator.archive = AsyncMock(return_value="summary")  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
+        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
+    ]
+    loop.sessions.save(session)
+    monkeypatch.setattr(session_module, "estimate_message_tokens", lambda _message: 60)
+
+    await loop.consolidator.maybe_archive_active_context_buffer(
+        session,
+        max_tokens=100,
+        safety_message_cap=1000,
+    )
+
+    loop.consolidator.archive.assert_not_awaited()
+    assert session.last_consolidated == 0
 
 
 @pytest.mark.asyncio

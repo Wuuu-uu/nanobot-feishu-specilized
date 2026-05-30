@@ -92,6 +92,32 @@ class TestCreateStreamingCard:
         assert chart, "streaming card should include a token chart element"
         assert chart[0]["height"] == "56px"
 
+    def test_card_payload_includes_source_header(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_123")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+
+        result = ch._create_streaming_card_sync(
+            "chat_id",
+            "oc_chat1",
+            metadata={
+                "_source_title": "Main Session 消息",
+                "_source_label": "Main Session · sessions/feishu_oc_chat1.jsonl",
+            },
+        )
+
+        assert result == "card_123"
+        request = ch._client.cardkit.v1.card.create.call_args[0][0]
+        payload = json.loads(request.body.data)
+        assert payload["header"]["title"] == {
+            "tag": "plain_text",
+            "content": "Main Session 消息",
+        }
+        assert payload["header"]["subtitle"] == {
+            "tag": "plain_text",
+            "content": "Main Session · sessions/feishu_oc_chat1.jsonl",
+        }
+
     def test_returns_none_on_failure(self):
         ch = _make_channel()
         resp = MagicMock()
@@ -171,6 +197,23 @@ class TestStreamUpdateText:
             "```"
         )
 
+    def test_formats_helper_json_before_stream_update(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response(True)
+
+        ok = ch._stream_update_text_sync(
+            "card_1",
+            '{"decision": "revise", "next": ["补充样例", "重跑测试"]}',
+            1,
+            metadata={"_source_title": "Helper Agent 消息"},
+        )
+
+        assert ok is True
+        request = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert "### decision\n- revise" in request.body.content
+        assert "### next\n- 补充样例\n- 重跑测试" in request.body.content
+        assert '{"decision"' not in request.body.content
+
 
 class TestSendDelta:
     @pytest.mark.asyncio
@@ -190,6 +233,27 @@ class TestSendDelta:
         ch._client.cardkit.v1.card.create.assert_called_once()
         ch._client.im.v1.message.create.assert_called_once()
         ch._client.cardkit.v1.card_element.content.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_first_delta_passes_source_metadata_to_streaming_card_header(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta(
+            "oc_chat1",
+            "Hello ",
+            {
+                "_stream_delta": True,
+                "_source_label": "Cron · sessions/cron_research.jsonl",
+            },
+        )
+
+        request = ch._client.cardkit.v1.card.create.call_args[0][0]
+        payload = json.loads(request.body.data)
+        assert payload["header"]["title"]["content"] == "Cron Agent 消息"
+        assert payload["header"]["subtitle"]["content"] == "Cron · sessions/cron_research.jsonl"
 
     @pytest.mark.asyncio
     async def test_non_stream_final_message_includes_buffered_token_chart(self):
@@ -215,7 +279,11 @@ class TestSendDelta:
         _, _, msg_type, raw_card = ch._send_message_sync.call_args[0]
         assert msg_type == "interactive"
         card = json.loads(raw_card)
-        chart = [el for el in card["elements"] if el.get("element_id") == "token_budget_chart"]
+        assert card["schema"] == "2.0"
+        chart = [
+            el for el in card["body"]["elements"]
+            if el.get("element_id") == "token_budget_chart"
+        ]
         assert chart
         values = chart[0]["chart_spec"]["data"]["values"]
         assert {"category": "token用量", "item": "缓存输入", "value": 1024} in values
@@ -678,7 +746,7 @@ class TestSendDelta:
             {},
         )
 
-        assert "   - 结果:\n```\n" in md
+        assert "**结果**\n```\n" in md
         assert "...（已截断）" in md
         assert "Token 统计" not in md
 
@@ -693,7 +761,7 @@ class TestSendDelta:
             {},
         )
 
-        assert "   - 结果:\n```json\n" in md
+        assert "**结果**\n```json\n" in md
         assert '"ok": true' in md
 
 

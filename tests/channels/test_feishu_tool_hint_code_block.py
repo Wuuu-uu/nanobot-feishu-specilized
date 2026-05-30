@@ -45,7 +45,8 @@ def _get_tool_hint_card(mock_send):
 
 
 def _get_tool_hint_markdown(card):
-    panel = card["elements"][0]
+    assert card["schema"] == "2.0"
+    panel = card["body"]["elements"][0]
     assert panel["tag"] == "collapsible_panel"
     assert panel["background_color"] == "grey"
     assert "工具调用详情" in panel["header"]["title"]["content"]

@@ -444,6 +444,52 @@ class MemoryStore:
             f"{formatted}"
         )
 
+    def append_formatted_history_chunks(
+        self,
+        messages: list[dict],
+        *,
+        label: str = "[RAW]",
+        max_chars: int | None = None,
+    ) -> int:
+        """Append raw formatted messages to history.jsonl without LLM summarization."""
+        if not messages:
+            return 0
+        limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
+        entries_written = 0
+        current_messages: list[dict] = []
+        current_lines: list[str] = []
+
+        def flush() -> None:
+            nonlocal entries_written, current_messages, current_lines
+            if not current_lines:
+                current_messages = []
+                return
+            header = f"{label} {len(current_messages)} messages\n"
+            available = max(256, limit - len(header))
+            suffix_len = len("\n... (truncated)")
+            formatted = truncate_text("\n".join(current_lines), max(0, available - suffix_len))
+            self.append_history(header + formatted, max_chars=limit)
+            entries_written += 1
+            current_messages = []
+            current_lines = []
+
+        for message in messages:
+            line = self._format_messages([message])
+            if not line:
+                continue
+            if len(line) > limit:
+                suffix_len = len("\n... (truncated)")
+                line = truncate_text(line, max(0, limit - suffix_len))
+            header_len = len(f"{label} {len(current_messages) + 1} messages\n")
+            projected = header_len + len("\n".join([*current_lines, line]))
+            if current_lines and projected > limit:
+                flush()
+            current_messages.append(message)
+            current_lines.append(line)
+
+        flush()
+        return entries_written
+
     def _split_raw_archive_chunks(self, messages: list[dict]) -> Iterator[tuple[bool, list[dict]]]:
         current_is_cold: bool | None = None
         current: list[dict] = []
@@ -531,6 +577,7 @@ class Consolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
+        active_context_archive_buffer_messages: int = 100,
     ):
         self.store = store
         self.provider = provider
@@ -541,6 +588,7 @@ class Consolidator:
         self.consolidation_ratio = consolidation_ratio
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self.active_context_archive_buffer_messages = active_context_archive_buffer_messages
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -794,6 +842,68 @@ class Consolidator:
                     "last_active": session.updated_at.isoformat(),
                 }
                 self.sessions.save(session)
+
+    async def maybe_archive_active_context_buffer(
+        self,
+        session: Session,
+        *,
+        max_tokens: int,
+        safety_message_cap: int = 1000,
+    ) -> None:
+        """Archive old messages that token-first replay already excludes.
+
+        Token consolidation is threshold-based on the full unconsolidated
+        backlog. This method covers the complementary case where the active
+        replay window/safety cap has already pushed older messages out of the
+        model prompt, but the full backlog is still below the hard context
+        threshold. Those messages remain in the raw session file, but once the
+        excluded prefix reaches a small buffer threshold we summarize it into
+        history.jsonl so Dream can process it promptly.
+        """
+        threshold = int(self.active_context_archive_buffer_messages or 0)
+        if threshold <= 0 or not session.messages:
+            return
+
+        lock = self.get_lock(session.key)
+        async with lock:
+            visible = session.get_history_token_first_with_indexes(
+                max_tokens=max_tokens,
+                include_timestamps=True,
+                safety_message_cap=safety_message_cap,
+            )
+            if not visible:
+                return
+
+            visible_start = max(session.last_consolidated, visible[0][0])
+            hidden_count = visible_start - session.last_consolidated
+            if hidden_count <= 0:
+                return
+            if hidden_count < threshold:
+                logger.debug(
+                    "Active context archive buffer idle {}: {}/{} msgs outside replay",
+                    session.key,
+                    hidden_count,
+                    threshold,
+                )
+                return
+
+            chunk = session.messages[session.last_consolidated:visible_start]
+            if not chunk:
+                return
+
+            entries = self.store.append_formatted_history_chunks(
+                chunk,
+                label="[RAW-ACTIVE-CONTEXT]",
+            )
+            logger.info(
+                "Active context raw archive for {}: {} msgs outside replay, {} history entries (threshold={})",
+                session.key,
+                len(chunk),
+                entries,
+                threshold,
+            )
+            session.last_consolidated = visible_start
+            self.sessions.save(session)
 
 
 # ---------------------------------------------------------------------------

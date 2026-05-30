@@ -1301,6 +1301,286 @@ def test_gateway_cron_job_suppresses_intermediate_progress(
     bus.publish_outbound.assert_not_awaited()
 
 
+def test_gateway_context_cron_can_suppress_model_content_progress(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.channels.send_autonomous_progress = False
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr(
+        "nanobot.providers.factory.build_provider_snapshot",
+        lambda _config: _test_provider_snapshot(object(), config),
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.factory.load_provider_snapshot",
+        lambda _config_path=None: _test_provider_snapshot(object(), config),
+    )
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.messages = []
+            self.metadata = {}
+
+        def add_message(self, role: str, content: str, **kwargs) -> None:
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    class _FakeSessionManager:
+        def __init__(self, _workspace: Path) -> None:
+            self.sessions: dict[str, _FakeSession] = {}
+
+        def get_or_create(self, key: str) -> _FakeSession:
+            return self.sessions.setdefault(key, _FakeSession())
+
+        def save(self, _session: _FakeSession) -> None:
+            return None
+
+        def safe_key(self, key: str) -> str:
+            return key.replace(":", "_")
+
+        def session_exists(self, key: str) -> bool:
+            return key in self.sessions
+
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
+
+    class _FakeCron:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+            seen["cron"] = self
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.model = "test-model"
+            self.tools = {}
+
+        async def process_direct(self, *_args, on_progress=None, **_kwargs):
+            assert on_progress is not None
+            await on_progress("cron model content before tool call")
+            await on_progress(
+                "tool hint text",
+                tool_hint=True,
+                tool_events=[{
+                    "version": 1,
+                    "phase": "usage",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }],
+            )
+            return OutboundMessage(
+                channel="feishu",
+                chat_id="oc_1",
+                content="final cron response",
+            )
+
+        async def close_mcp(self) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _StopAfterCronSetup:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+    assert isinstance(result.exception, _StopGatewayError)
+
+    cron = seen["cron"]
+    job = CronJob(
+        id="cron-context-silent-test",
+        name="test-context-silent",
+        payload=CronPayload(
+            message="Run something.",
+            kind="agent_turn_with_context",
+            deliver=False,
+            channel="feishu",
+            to="oc_1",
+            session_key="feishu:oc_1:main",
+            context_session_key="feishu:oc_1:main",
+            sync_session_key="feishu:oc_1:main",
+            worker_session_key="cron:test-context-silent",
+        ),
+    )
+
+    response = asyncio.run(cron.on_job(job))
+
+    assert response == "final cron response"
+    bus.publish_outbound.assert_awaited_once()
+    msg = bus.publish_outbound.await_args.args[0]
+    assert msg.content == ""
+    assert msg.metadata["_tool_events"][0]["phase"] == "usage"
+    assert msg.metadata["_source_label"].startswith("Cron · sessions/cron_test-context-silent")
+
+
+def test_gateway_context_cron_streams_when_channel_streaming_enabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "config-workspace")
+    config.channels.feishu = {"enabled": True}
+    bus = MagicMock()
+    bus.publish_outbound = AsyncMock()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr(
+        "nanobot.providers.factory.build_provider_snapshot",
+        lambda _config: _test_provider_snapshot(object(), _config),
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.factory.load_provider_snapshot",
+        lambda _config_path=None: _test_provider_snapshot(object(), config),
+    )
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.messages = []
+            self.metadata = {}
+
+        def add_message(self, role: str, content: str, **kwargs) -> None:
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    class _FakeSessionManager:
+        def __init__(self, _workspace: Path) -> None:
+            self.sessions: dict[str, _FakeSession] = {}
+
+        def get_or_create(self, key: str) -> _FakeSession:
+            return self.sessions.setdefault(key, _FakeSession())
+
+        def save(self, _session: _FakeSession) -> None:
+            return None
+
+        def safe_key(self, key: str) -> str:
+            return key.replace(":", "_")
+
+        def session_exists(self, key: str) -> bool:
+            return key in self.sessions
+
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
+
+    class _FakeCron:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+            seen["cron"] = self
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            self.model = "test-model"
+            self.tools = {}
+
+        async def process_direct(
+            self,
+            *_args,
+            on_progress=None,
+            on_stream=None,
+            on_stream_end=None,
+            **_kwargs,
+        ):
+            assert on_progress is not None
+            assert on_stream is not None
+            assert on_stream_end is not None
+            await on_stream("first")
+            await on_stream_end(resuming=True)
+            await on_progress(
+                "",
+                tool_events=[{
+                    "version": 1,
+                    "phase": "usage",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+                }],
+            )
+            await on_stream("second")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(
+                channel="feishu",
+                chat_id="oc_1",
+                content="firstsecond",
+                metadata={"_streamed": True},
+            )
+
+        async def close_mcp(self) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _StopAfterCronSetup:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+    assert isinstance(result.exception, _StopGatewayError)
+
+    cron = seen["cron"]
+    job = CronJob(
+        id="cron-context-stream-test",
+        name="test-context-stream",
+        payload=CronPayload(
+            message="Run something.",
+            kind="agent_turn_with_context",
+            deliver=True,
+            channel="feishu",
+            to="oc_1",
+            session_key="feishu:oc_1:main",
+            context_session_key="feishu:oc_1:main",
+            sync_session_key="feishu:oc_1:main",
+            worker_session_key="cron:test-context-stream",
+        ),
+    )
+
+    response = asyncio.run(cron.on_job(job))
+
+    assert response == "firstsecond"
+    sent = [call.args[0] for call in bus.publish_outbound.await_args_list]
+    assert [msg.content for msg in sent] == ["first", "", "", "second", "", "firstsecond"]
+    assert sent[0].metadata["_stream_delta"] is True
+    assert sent[1].metadata["_stream_end"] is True
+    assert sent[1].metadata["_resuming"] is True
+    assert sent[2].metadata["_progress"] is True
+    assert sent[2].metadata["_tool_events"][0]["phase"] == "usage"
+    assert sent[3].metadata["_stream_delta"] is True
+    assert sent[4].metadata["_stream_end"] is True
+    assert sent[4].metadata["_resuming"] is False
+    stream_ids = {msg.metadata["_stream_id"] for msg in sent[:5]}
+    assert len(stream_ids) == 1
+    assert next(iter(stream_ids)).startswith("cron:test-context-stream:cron-context-stream-test:")
+    assert sent[5].metadata["_streamed"] is True
+    assert "_stream_delta" not in sent[5].metadata
+
+
 def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     monkeypatch, tmp_path: Path
 ) -> None:

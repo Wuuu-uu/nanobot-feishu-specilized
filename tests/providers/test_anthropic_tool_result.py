@@ -55,3 +55,98 @@ def test_tool_result_block_preserves_string_content():
     assert block["type"] == "tool_result"
     assert block["tool_use_id"] == "call_2"
     assert block["content"] == "plain tool output"
+
+
+def test_convert_messages_normalizes_invalid_tool_ids_consistently():
+    provider = AnthropicProvider(api_key="test-key")
+    invalid_id = "call_abc|fc_123"
+
+    _system, messages = provider._convert_messages([
+        {
+            "role": "user",
+            "content": "run a tool",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": invalid_id,
+                "function": {
+                    "name": "exec",
+                    "arguments": '{"command": "pwd"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": invalid_id,
+            "name": "exec",
+            "content": "/home/wulin",
+        },
+        {
+            "role": "user",
+            "content": "continue",
+        },
+    ])
+
+    tool_use = messages[1]["content"][0]
+    tool_result = messages[2]["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_result["type"] == "tool_result"
+    assert tool_use["id"] == tool_result["tool_use_id"]
+    assert "|" not in tool_use["id"]
+    assert tool_use["id"].startswith("toolu_")
+
+
+def test_convert_messages_preserves_valid_tool_ids():
+    provider = AnthropicProvider(api_key="test-key")
+
+    _system, messages = provider._convert_messages([
+        {"role": "user", "content": "run a tool"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_good-123",
+                "function": {"name": "exec", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_good-123",
+            "name": "exec",
+            "content": "ok",
+        },
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert messages[1]["content"][0]["id"] == "call_good-123"
+    assert messages[2]["content"][0]["tool_use_id"] == "call_good-123"
+
+
+def test_convert_messages_normalizes_raw_anthropic_tool_use_blocks():
+    provider = AnthropicProvider(api_key="test-key")
+    invalid_id = "raw.tool.use"
+
+    _system, messages = provider._convert_messages([
+        {"role": "user", "content": "run a tool"},
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": invalid_id,
+                "name": "exec",
+                "input": {},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": invalid_id,
+            "name": "exec",
+            "content": "ok",
+        },
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert messages[1]["content"][0]["id"] == messages[2]["content"][0]["tool_use_id"]
+    assert "." not in messages[1]["content"][0]["id"]

@@ -65,6 +65,41 @@ def test_add_job_preserves_channel_meta_and_session_key(tmp_path) -> None:
     assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
 
 
+def test_add_context_agent_job_preserves_sync_fields(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    job = service.add_job(
+        name="research loop",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="keep iterating",
+        kind="agent_turn_with_context",
+        deliver=True,
+        channel="feishu",
+        to="ou_123",
+        session_key="feishu:ou_123:main",
+        context_session_key="feishu:ou_123:main",
+        sync_session_key="feishu:ou_123:main",
+        worker_session_key="cron:research",
+        last_sync_message_timestamp="2026-05-21T01:00:00",
+        sync_max_messages=7,
+        sync_max_chars=9000,
+    )
+
+    assert job.payload.kind == "agent_turn_with_context"
+    assert job.payload.context_session_key == "feishu:ou_123:main"
+    assert job.payload.last_sync_message_timestamp == "2026-05-21T01:00:00"
+
+    reloaded = CronService(store_path).get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.payload.kind == "agent_turn_with_context"
+    assert reloaded.payload.context_session_key == "feishu:ou_123:main"
+    assert reloaded.payload.sync_session_key == "feishu:ou_123:main"
+    assert reloaded.payload.worker_session_key == "cron:research"
+    assert reloaded.payload.last_sync_message_timestamp == "2026-05-21T01:00:00"
+    assert reloaded.payload.sync_max_messages == 7
+    assert reloaded.payload.sync_max_chars == 9000
+
+
 @pytest.mark.asyncio
 async def test_channel_meta_and_session_key_survive_store_reload(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
@@ -94,6 +129,64 @@ async def test_channel_meta_and_session_key_survive_store_reload(tmp_path) -> No
     assert reloaded is not None
     assert reloaded.payload.channel_meta == meta
     assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
+
+
+@pytest.mark.asyncio
+async def test_start_preserves_future_next_run_at(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    job = service.add_job(
+        name="interval",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+    service._running = True
+    service._load_store()
+    future_ms = int(time.time() * 1000) + 30_000
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    loaded.state.next_run_at_ms = future_ms
+    service._save_store()
+    service._running = False
+
+    fresh = CronService(store_path)
+    await fresh.start()
+    try:
+        preserved = fresh.get_job(job.id)
+        assert preserved is not None
+        assert preserved.state.next_run_at_ms == future_ms
+    finally:
+        fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_recomputes_stale_next_run_at(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    job = service.add_job(
+        name="interval",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+    service._running = True
+    service._load_store()
+    stale_ms = max(1, int(time.time() * 1000) - 30_000)
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    loaded.state.next_run_at_ms = stale_ms
+    service._save_store()
+    service._running = False
+
+    fresh = CronService(store_path)
+    await fresh.start()
+    try:
+        recomputed = fresh.get_job(job.id)
+        assert recomputed is not None
+        assert recomputed.state.next_run_at_ms is not None
+        assert recomputed.state.next_run_at_ms > int(time.time() * 1000)
+        assert recomputed.state.next_run_at_ms != stale_ms
+    finally:
+        fresh.stop()
 
 
 @pytest.mark.asyncio
@@ -135,6 +228,40 @@ async def test_run_history_records_errors(tmp_path) -> None:
     assert len(loaded.state.run_history) == 1
     assert loaded.state.run_history[0].status == "error"
     assert loaded.state.run_history[0].error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_per_job_running_lock_skips_overlapping_run(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(_job) -> None:
+        entered.set()
+        await release.wait()
+
+    service = CronService(store_path, on_job=slow)
+    job = service.add_job(
+        name="overlap",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+
+    first = asyncio.create_task(service.run_job(job.id, force=True))
+    await entered.wait()
+    second = await service.run_job(job.id, force=True)
+    release.set()
+    first_result = await first
+
+    assert first_result is True
+    assert second is False
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    statuses = [record.status for record in loaded.state.run_history]
+    assert "ok" in statuses
+    assert "skipped" in statuses
+    skipped = next(record for record in loaded.state.run_history if record.status == "skipped")
+    assert skipped.error == "already running"
 
 
 @pytest.mark.asyncio

@@ -85,6 +85,34 @@ def test_opus_4_7_omits_temperature_none() -> None:
     assert "thinking" not in kw
 
 
+def test_opus_4_8_high_uses_adaptive_output_config_effort() -> None:
+    kw = _build(_make_provider("claude-opus-4-8"), "high", max_tokens=4096)
+    assert "temperature" not in kw
+    assert kw["thinking"] == {"type": "adaptive"}
+    assert kw["output_config"] == {"effort": "high"}
+    assert kw["max_tokens"] == 4096
+
+
+def test_opus_4_8_adaptive_omits_output_config_effort() -> None:
+    kw = _build(_make_provider("claude-opus-4-8"), "adaptive")
+    assert "temperature" not in kw
+    assert kw["thinking"] == {"type": "adaptive"}
+    assert "output_config" not in kw
+
+
+def test_opus_4_8_unknown_effort_defaults_to_medium() -> None:
+    kw = _build(_make_provider("claude-opus-4-8"), "deep")
+    assert kw["thinking"] == {"type": "adaptive"}
+    assert kw["output_config"] == {"effort": "medium"}
+
+
+def test_opus_4_8_none_omits_thinking_and_temperature() -> None:
+    kw = _build(_make_provider("claude-opus-4-8"), None)
+    assert "temperature" not in kw
+    assert "thinking" not in kw
+    assert "output_config" not in kw
+
+
 def test_reasoning_effort_string_none_does_not_enable_thinking() -> None:
     """reasoning_effort='none' must not enable thinking — treated same as disabled."""
     kw = _build(_make_provider(), "none")

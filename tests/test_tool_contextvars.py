@@ -218,6 +218,30 @@ async def test_cron_tool_basic_set_context_and_execute(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cron_tool_context_job_defaults_to_current_session(tmp_path) -> None:
+    tool = CronTool(CronService(tmp_path / "jobs.json"))
+    tool.set_context("feishu", "ou_123", session_key="feishu:ou_123:main")
+
+    result = await tool.execute(
+        action="add",
+        kind="agent_turn_with_context",
+        message="monitor progress",
+        every_seconds=1800,
+    )
+
+    assert result.startswith("Created job")
+    jobs = tool._cron.list_jobs()
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.payload.kind == "agent_turn_with_context"
+    assert job.payload.deliver is True
+    assert job.payload.session_key == "feishu:ou_123:main"
+    assert job.payload.context_session_key == "feishu:ou_123:main"
+    assert job.payload.sync_session_key == "feishu:ou_123:main"
+    assert job.payload.worker_session_key is None
+
+
+@pytest.mark.asyncio
 async def test_cron_tool_no_context_returns_error(tmp_path) -> None:
     """Without set_context, add should fail with a clear error."""
     tool = CronTool(CronService(tmp_path / "jobs.json"))

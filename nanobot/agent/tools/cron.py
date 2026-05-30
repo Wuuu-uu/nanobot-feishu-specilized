@@ -25,9 +25,39 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "to execute when the job triggers (e.g., 'Send a reminder to WeChat: xxx' or "
         "'Check system status and report'). Prefix with RUN: for deterministic exec jobs."
     ),
+    kind=StringSchema(
+        "Optional job type for action='add'. Use agent_turn for ordinary scheduled agent "
+        "messages, agent_turn_with_context for an autonomous worker session with lightweight "
+        "main-session delivery/linkage, or exec for deterministic commands.",
+        enum=["agent_turn", "agent_turn_with_context", "exec"],
+    ),
     command=StringSchema(
         "Optional shell command for deterministic exec cron jobs when action='add'. "
         "Executed through nanobot's exec tool policy when the job fires."
+    ),
+    context_session_key=StringSchema(
+        "Optional for kind='agent_turn_with_context': main session key that owns/steers "
+        "the worker. Defaults to the current session."
+    ),
+    sync_session_key=StringSchema(
+        "Optional for kind='agent_turn_with_context': session key that receives the "
+        "worker's lightweight tagged progress summaries. Defaults to context_session_key."
+    ),
+    worker_session_key=StringSchema(
+        "Optional for kind='agent_turn_with_context': independent worker session key. "
+        "Defaults to cron:<job_id>. Do not set this to the main/session sync key."
+    ),
+    sync_max_messages=IntegerSchema(
+        12,
+        description="Legacy compatibility field for older context-sync jobs; ignored by new cron workers.",
+        minimum=1,
+        maximum=100,
+    ),
+    sync_max_chars=IntegerSchema(
+        12000,
+        description="Legacy compatibility field for older context-sync jobs; ignored by new cron workers.",
+        minimum=1000,
+        maximum=100000,
     ),
     every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
@@ -155,6 +185,7 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         at_time: str | None = None,
+        kind: str | None = None,
         command: str = "",
         timeout_seconds: int | None = None,
         job_id: str | None = None,
@@ -162,6 +193,11 @@ class CronTool(Tool):
         enabled: bool = True,
         force: bool = False,
         include_disabled: bool = False,
+        context_session_key: str | None = None,
+        sync_session_key: str | None = None,
+        worker_session_key: str | None = None,
+        sync_max_messages: int = 12,
+        sync_max_chars: int = 12000,
         **kwargs: Any,
     ) -> str:
         if action == "add":
@@ -177,6 +213,12 @@ class CronTool(Tool):
                 deliver,
                 command=command,
                 timeout_seconds=timeout_seconds,
+                kind=kind,
+                context_session_key=context_session_key,
+                sync_session_key=sync_session_key,
+                worker_session_key=worker_session_key,
+                sync_max_messages=sync_max_messages,
+                sync_max_chars=sync_max_chars,
             )
         elif action == "list":
             return self._list_jobs(include_disabled=include_disabled)
@@ -200,17 +242,31 @@ class CronTool(Tool):
         *,
         command: str = "",
         timeout_seconds: int | None = None,
+        kind: str | None = None,
+        context_session_key: str | None = None,
+        sync_session_key: str | None = None,
+        worker_session_key: str | None = None,
+        sync_max_messages: int = 12,
+        sync_max_chars: int = 12000,
     ) -> str:
         normalized_message = (message or "").strip()
         normalized_command = (command or "").strip()
-        payload_kind = "agent_turn"
+        requested_kind = (kind or "").strip()
+        if requested_kind and requested_kind not in {"agent_turn", "agent_turn_with_context", "exec"}:
+            return "Error: kind must be one of agent_turn, agent_turn_with_context, exec"
+
+        payload_kind = requested_kind or "agent_turn"
         payload_command = ""
         payload_message = message or ""
         if normalized_command:
+            if requested_kind == "agent_turn_with_context":
+                return "Error: command cannot be combined with kind='agent_turn_with_context'"
             payload_kind = "exec"
             payload_command = normalized_command
             payload_message = payload_message or f"RUN:{payload_command}"
         elif normalized_message.startswith("RUN:"):
+            if requested_kind == "agent_turn_with_context":
+                return "Error: RUN: command jobs cannot use kind='agent_turn_with_context'"
             payload_command = normalized_message[4:].strip()
             if not payload_command:
                 return "Error: RUN: command is empty"
@@ -224,6 +280,10 @@ class CronTool(Tool):
         should_deliver = payload_kind != "exec" if deliver is None else bool(deliver)
         if timeout_seconds is not None and timeout_seconds <= 0:
             return "Error: timeout_seconds must be > 0"
+        if sync_max_messages <= 0:
+            return "Error: sync_max_messages must be > 0"
+        if sync_max_chars <= 0:
+            return "Error: sync_max_chars must be > 0"
         channel = self._channel.get()
         chat_id = self._chat_id.get()
         if not channel or not chat_id:
@@ -260,6 +320,21 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        current_session_key = self._session_key.get() or f"{channel}:{chat_id}"
+        context_key = (context_session_key or "").strip() or None
+        sync_key = (sync_session_key or "").strip() or None
+        worker_key = (worker_session_key or "").strip() or None
+        if payload_kind == "agent_turn_with_context":
+            context_key = context_key or current_session_key
+            sync_key = sync_key or context_key
+            if worker_key and worker_key in {context_key, sync_key}:
+                return "Error: worker_session_key must be independent from context/sync session keys"
+        elif any([context_key, sync_key, worker_key]):
+            return (
+                "Error: context_session_key, sync_session_key, and worker_session_key "
+                "are only valid with kind='agent_turn_with_context'"
+            )
+
         job = self._cron.add_job(
             name=name or payload_message[:30] or f"RUN:{payload_command}"[:30],
             schedule=schedule,
@@ -272,7 +347,12 @@ class CronTool(Tool):
             to=chat_id,
             delete_after_run=delete_after,
             channel_meta=self._metadata.get(),
-            session_key=self._session_key.get() or None,
+            session_key=current_session_key or None,
+            context_session_key=context_key,
+            sync_session_key=sync_key,
+            worker_session_key=worker_key,
+            sync_max_messages=sync_max_messages,
+            sync_max_chars=sync_max_chars,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -333,6 +413,16 @@ class CronTool(Tool):
                 parts.append("  Type: exec command")
                 if j.payload.deliver:
                     parts.append("  Delivery: command result will be delivered")
+            elif j.payload.kind == "agent_turn_with_context":
+                parts.append("  Type: autonomous worker agent turn")
+                if j.payload.context_session_key:
+                    parts.append(f"  Context session: {j.payload.context_session_key}")
+                if j.payload.sync_session_key:
+                    parts.append(f"  Sync session: {j.payload.sync_session_key}")
+                worker = j.payload.worker_session_key or f"cron:{j.id}"
+                parts.append(f"  Worker session: {worker}")
+                if j.payload.last_sync_message_timestamp:
+                    parts.append(f"  Last sync timestamp: {j.payload.last_sync_message_timestamp}")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)

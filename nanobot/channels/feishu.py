@@ -83,6 +83,12 @@ def _extract_interactive_content(content: dict) -> list[str]:
         for element in elements:
             parts.extend(_extract_element_content(element))
 
+    body = content.get("body", {})
+    body_elements = body.get("elements", []) if isinstance(body, dict) else []
+    if isinstance(body_elements, list):
+        for element in body_elements:
+            parts.extend(_extract_element_content(element))
+
     card = content.get("card", {})
     if card:
         parts.extend(_extract_interactive_content(card))
@@ -94,6 +100,11 @@ def _extract_interactive_content(content: dict) -> list[str]:
             header_text = header_title.get("content", "") or header_title.get("text", "")
             if header_text:
                 parts.append(f"title: {header_text}")
+        header_subtitle = header.get("subtitle", {})
+        if isinstance(header_subtitle, dict):
+            subtitle_text = header_subtitle.get("content", "") or header_subtitle.get("text", "")
+            if subtitle_text:
+                parts.append(f"subtitle: {subtitle_text}")
 
     return parts
 
@@ -270,6 +281,7 @@ _EMPTY_TOOL_LOGS_MARKDOWN = "**工具调用记录**\n\n暂无工具调用。"
 
 _TOOL_DISPLAY_NAMES: dict[str, str] = {
     "append_file": "追加文件",
+    "autopilot_help": "辅助审阅",
     "cron": "定时任务",
     "edit_file": "编辑文件",
     "exec": "执行命令",
@@ -663,7 +675,24 @@ class FeishuChannel(BaseChannel):
     def _stream_key(chat_id: str, metadata: dict[str, Any] | None = None) -> str:
         """Scope streaming buffers to the inbound message when available."""
         meta = metadata or {}
-        return meta.get("message_id") or chat_id
+        return meta.get("_stream_id") or meta.get("message_id") or chat_id
+
+    def _stream_buf_for_key(self, chat_id: str, stream_key: str) -> _FeishuStreamBuf | None:
+        """Return a stream buffer, migrating pre-stream tool hints when safe.
+
+        Older progress callers may emit a tool event before the first answer
+        delta without an explicit ``_stream_id``. Once the first delta arrives
+        with a stream id, move that empty, not-yet-sent chat-level buffer so
+        the tool panel stays attached to the answer card.
+        """
+        buf = self._stream_bufs.get(stream_key)
+        if buf is not None or stream_key == chat_id:
+            return buf
+        legacy = self._stream_bufs.get(chat_id)
+        if legacy and legacy.card_id is None and not legacy.text:
+            self._stream_bufs[stream_key] = self._stream_bufs.pop(chat_id)
+            return legacy
+        return None
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -671,9 +700,10 @@ class FeishuChannel(BaseChannel):
         re.MULTILINE,
     )
 
-    _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+    _HEADING_RE = re.compile(r"^(?:(#{1,6})\s+(.+)|【(.+?)】\s*)$", re.MULTILINE)
 
-    _CODE_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
+    _CODE_BLOCK_RE = re.compile(r"(```[\s\S]*?```|~~~[\s\S]*?~~~)", re.MULTILINE)
+    _CODE_PLACEHOLDER_RE = re.compile(r"\x00CODE(\d+)\x00")
     _INDENTED_CODE_FENCE_RE = re.compile(r"^([ \t]{1,3})(`{3,}|~{3,})(.*)$")
 
     # Markdown formatting patterns that should be stripped from plain-text
@@ -724,21 +754,154 @@ class FeishuChannel(BaseChannel):
             ],
         }
 
-    def _build_card_elements(self, content: str) -> list[dict]:
-        """Split content into div/markdown + table elements for Feishu card."""
-        elements, last_end = [], 0
-        for m in self._TABLE_RE.finditer(content):
-            before = content[last_end : m.start()]
-            if before.strip():
-                elements.extend(self._split_headings(before))
-            elements.append(
-                self._parse_md_table(m.group(1)) or {"tag": "markdown", "content": m.group(1)}
-            )
-            last_end = m.end()
-        remaining = content[last_end:]
-        if remaining.strip():
-            elements.extend(self._split_headings(remaining))
-        return elements or [{"tag": "markdown", "content": content}]
+    @staticmethod
+    def _source_label(metadata: dict[str, Any] | None) -> str:
+        meta = metadata or {}
+        label = meta.get("_source_label") or meta.get("_cron_source_label")
+        return str(label).strip() if label else ""
+
+    @staticmethod
+    def _source_title(metadata: dict[str, Any] | None) -> str:
+        meta = metadata or {}
+        title = meta.get("_source_title")
+        if title:
+            return str(title).strip()
+        return "Cron Agent 消息"
+
+    @classmethod
+    def _build_card(cls, elements: list[dict], metadata: dict[str, Any] | None = None) -> dict:
+        """Build a Feishu CardKit JSON 2.0 card with optional source header."""
+        card: dict[str, Any] = {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+                "update_multi": True,
+            },
+            "body": {"elements": elements},
+        }
+        if header := cls._card_header(metadata):
+            card["header"] = header
+        return card
+
+    @classmethod
+    def _card_header(cls, metadata: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        if not (label := cls._source_label(metadata)):
+            return None
+        return {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": cls._source_title(metadata),
+            },
+            "subtitle": {
+                "tag": "plain_text",
+                "content": cls._strip_md_formatting(label),
+            },
+        }
+
+    @staticmethod
+    def _markdown_text_element(content: str) -> dict:
+        return {
+            "tag": "markdown",
+            "content": content,
+        }
+
+    @staticmethod
+    def _card_markdown_element(content: str, element_id: str = "message_markdown") -> dict:
+        return {
+            "tag": "markdown",
+            "content": content,
+            "element_id": element_id,
+        }
+
+    @staticmethod
+    def _tool_observability_panel(content: str, *, expanded: bool = False) -> dict:
+        return {
+            "tag": "collapsible_panel",
+            "element_id": "tool_logs_panel",
+            "expanded": expanded,
+            "vertical_spacing": "8px",
+            "padding": "8px 8px 8px 8px",
+            "background_color": "grey",
+            "header": {
+                "title": {"tag": "markdown", "content": "**工具调用详情**"},
+                "background_color": "grey",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "size": "16px 16px",
+                },
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "elements": [{
+                "tag": "markdown",
+                "content": content,
+                "element_id": _TOOL_LOGS_ELEMENT_ID,
+                "text_size": _TOOL_LOGS_TEXT_SIZE,
+            }],
+        }
+
+    def _build_markdown_card_elements(
+        self,
+        content: str,
+        *,
+        tool_events: list[dict[str, Any]] | None = None,
+        token_usage: dict[str, int] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build CardKit JSON 2.0 body elements for a full markdown response."""
+        elements: list[dict[str, Any]] = []
+        obs = self._format_observability_markdown(tool_events or [], token_usage or {})
+        if obs != _EMPTY_TOOL_LOGS_MARKDOWN:
+            elements.append(self._tool_observability_panel(obs, expanded=False))
+
+        content = self._format_helper_json_as_markdown(content, metadata)
+        normalized = self._normalize_card_markdown((content or "").strip())
+        if normalized:
+            elements.append(self._card_markdown_element(normalized))
+
+        if token_usage:
+            elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
+            elements.append({
+                "tag": "chart",
+                "chart_spec": self._token_chart_spec(token_usage),
+                "element_id": _TOKEN_CHART_ELEMENT_ID,
+                "color_theme": "complementary",
+                "height": _TOKEN_CHART_HEIGHT,
+                "margin": "0px 0px 0px 0px",
+            })
+
+        return elements or [self._card_markdown_element("")]
+
+    @classmethod
+    def _heading_element(cls, text: str) -> dict:
+        stripped = text.strip()
+        return {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**{cls._strip_md_formatting(stripped)}**" if stripped else "",
+            },
+        }
+
+    @classmethod
+    def _body_elements_from_protected(
+        cls, content: str, code_blocks: list[str] | None = None
+    ) -> list[dict]:
+        for i, cb in enumerate(code_blocks or []):
+            content = content.replace(f"\x00CODE{i}\x00", cb)
+        stripped = content.strip()
+        return [cls._markdown_text_element(stripped)] if stripped else []
+
+    def _build_card_elements(
+        self,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[dict]:
+        """Build CardKit JSON 2.0 markdown elements for Feishu cards."""
+        return self._build_markdown_card_elements(content, metadata=metadata)
 
     @staticmethod
     def _split_elements_by_table_limit(
@@ -784,29 +947,14 @@ class FeishuChannel(BaseChannel):
         for m in self._HEADING_RE.finditer(protected):
             before = protected[last_end : m.start()].strip()
             if before:
-                elements.append({"tag": "markdown", "content": before})
-            text = self._strip_md_formatting(m.group(2).strip())
-            display_text = f"**{text}**" if text else ""
-            elements.append(
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": display_text,
-                    },
-                }
-            )
+                elements.extend(self._body_elements_from_protected(before, code_blocks))
+            elements.append(self._heading_element((m.group(2) or m.group(3) or "").strip()))
             last_end = m.end()
         remaining = protected[last_end:].strip()
         if remaining:
-            elements.append({"tag": "markdown", "content": remaining})
+            elements.extend(self._body_elements_from_protected(remaining, code_blocks))
 
-        for i, cb in enumerate(code_blocks):
-            for el in elements:
-                if el.get("tag") == "markdown":
-                    el["content"] = el["content"].replace(f"\x00CODE{i}\x00", cb)
-
-        return elements or [{"tag": "markdown", "content": content}]
+        return elements or [self._markdown_text_element(content)]
 
     @classmethod
     def _normalize_card_markdown(cls, content: str) -> str:
@@ -864,6 +1012,8 @@ class FeishuChannel(BaseChannel):
     _SIMPLE_MD_RE = re.compile(
         r"\*\*.+?\*\*"  # **bold**
         r"|__.+?__"  # __bold__
+        r"|`[^`\n]+?`"  # inline code
+        r"|(?<!\$)\$(?!\$)[^\n$]+?\$(?!\$)"  # inline math
         r"|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"  # *italic* (single *)
         r"|~~.+?~~",  # ~~strikethrough~~
         re.DOTALL,
@@ -1312,6 +1462,7 @@ class FeishuChannel(BaseChannel):
         reply_in_thread: bool = False,
         tool_logs: str | None = None,
         token_usage: dict[str, int] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id.
 
@@ -1372,11 +1523,14 @@ class FeishuChannel(BaseChannel):
                         "margin": "0px 0px 0px 0px",
                     },
                 ])
-            return {
+            payload: dict[str, Any] = {
                 "schema": "2.0",
                 "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
                 "body": {"elements": elements},
             }
+            if header := self._card_header(metadata):
+                payload["header"] = header
+            return payload
 
         card_json = _card_payload(include_observability=True, include_chart=True)
 
@@ -1436,6 +1590,7 @@ class FeishuChannel(BaseChannel):
         content: str,
         sequence: int,
         element_id: str = _STREAM_ELEMENT_ID,
+        metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Stream-update the markdown element on a CardKit card (typewriter effect)."""
         from lark_oapi.api.cardkit.v1 import (
@@ -1444,6 +1599,7 @@ class FeishuChannel(BaseChannel):
         )
 
         try:
+            content = self._format_helper_json_as_markdown(content, metadata)
             content = self._normalize_card_markdown(content)
             request = (
                 ContentCardElementRequest.builder()
@@ -1552,6 +1708,175 @@ class FeishuChannel(BaseChannel):
         return text.replace("```", "'''")
 
     @classmethod
+    def _preview_tool_argument_value(cls, value: Any, max_chars: int) -> Any:
+        if value is None:
+            return None
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+            serializable = True
+        except TypeError:
+            text = str(value)
+            serializable = False
+
+        if len(text) <= max_chars:
+            return value if serializable else text
+        if isinstance(value, str):
+            return value[:max_chars] + "...（已截断）"
+        return text[:max_chars].rstrip() + "\n...（已截断）"
+
+    @classmethod
+    def _format_tool_arguments_block(
+        cls,
+        arguments: Any,
+        *,
+        max_value_chars: int = 520,
+    ) -> str:
+        if arguments in (None, "", {}, []):
+            return ""
+
+        if not isinstance(arguments, dict):
+            preview_value = cls._preview_tool_argument_value(arguments, max_value_chars)
+            try:
+                preview = json.dumps(preview_value, ensure_ascii=False, indent=2)
+            except TypeError:
+                preview = str(preview_value)
+            return preview.replace("```", "'''")
+
+        preview_args = {
+            str(key): cls._preview_tool_argument_value(value, max_value_chars)
+            for key, value in arguments.items()
+        }
+        try:
+            preview = json.dumps(preview_args, ensure_ascii=False, indent=2)
+        except TypeError:
+            preview = str(preview_args)
+        return preview.replace("```", "'''")
+
+    @classmethod
+    def _is_helper_source(cls, metadata: dict[str, Any] | None) -> bool:
+        meta = metadata or {}
+        return (
+            str(meta.get("_source_title") or "").strip() == "Helper Agent 消息"
+            or bool(meta.get("_helper_source_session"))
+            or bool(meta.get("_autopilot_helper_active"))
+        )
+
+    @staticmethod
+    def _json_candidate_from_content(content: str) -> str:
+        text = (content or "").strip()
+        match = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else text
+
+    @classmethod
+    def _format_helper_json_as_markdown(
+        cls,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> str:
+        if not cls._is_helper_source(metadata):
+            return content
+
+        candidate = cls._json_candidate_from_content(content)
+        if not candidate:
+            return content
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            return content
+
+        rendered = cls._json_to_markdown(parsed).strip()
+        return rendered or content
+
+    @staticmethod
+    def _json_heading_text(value: Any) -> str:
+        text = " ".join(str(value).split())
+        return text or "未命名"
+
+    @staticmethod
+    def _json_scalar_text(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int | float):
+            return str(value)
+        return str(value).strip() or "（空）"
+
+    @classmethod
+    def _append_json_scalar_markdown(cls, lines: list[str], value: Any) -> None:
+        text = cls._json_scalar_text(value)
+        parts = [line.strip() for line in text.splitlines() if line.strip()]
+        if not parts:
+            lines.append("- （空）")
+            return
+        for part in parts:
+            lines.append(f"- {part}")
+
+    @classmethod
+    def _append_json_markdown(
+        cls,
+        lines: list[str],
+        value: Any,
+        *,
+        heading_level: int,
+    ) -> None:
+        if isinstance(value, dict):
+            if not value:
+                lines.append("- {}")
+                return
+            for raw_key, child in value.items():
+                if lines and lines[-1] != "":
+                    lines.append("")
+                key = cls._json_heading_text(raw_key)
+                if heading_level <= 6:
+                    lines.append(f"{'#' * heading_level} {key}")
+                    cls._append_json_markdown(lines, child, heading_level=heading_level + 1)
+                else:
+                    lines.append(f"**{key}**")
+                    cls._append_json_markdown(lines, child, heading_level=heading_level)
+            return
+
+        if isinstance(value, list):
+            if not value:
+                lines.append("- []")
+                return
+            if all(not isinstance(item, dict | list) for item in value):
+                for item in value:
+                    cls._append_json_scalar_markdown(lines, item)
+                return
+            for idx, item in enumerate(value, start=1):
+                if isinstance(item, dict):
+                    if len(value) > 1:
+                        if lines and lines[-1] != "":
+                            lines.append("")
+                        level = min(heading_level, 6)
+                        lines.append(f"{'#' * level} 第 {idx} 项")
+                        cls._append_json_markdown(lines, item, heading_level=heading_level + 1)
+                    else:
+                        cls._append_json_markdown(lines, item, heading_level=heading_level)
+                elif isinstance(item, list):
+                    if lines and lines[-1] != "":
+                        lines.append("")
+                    level = min(heading_level, 6)
+                    lines.append(f"{'#' * level} 第 {idx} 项")
+                    cls._append_json_markdown(lines, item, heading_level=heading_level + 1)
+                else:
+                    cls._append_json_scalar_markdown(lines, item)
+            return
+
+        cls._append_json_scalar_markdown(lines, value)
+
+    @classmethod
+    def _json_to_markdown(cls, value: Any) -> str:
+        lines: list[str] = []
+        if isinstance(value, dict):
+            cls._append_json_markdown(lines, value, heading_level=3)
+        else:
+            lines.append("### Helper Agent 输出")
+            cls._append_json_markdown(lines, value, heading_level=4)
+        return "\n".join(lines)
+
+    @classmethod
     def _merge_tool_events(cls, tool_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged: OrderedDict[str, dict[str, Any]] = OrderedDict()
         for index, event in enumerate(tool_events[-50:]):
@@ -1607,22 +1932,33 @@ class FeishuChannel(BaseChannel):
                 phase = str(item.get("phase") or "start").lower()
                 status = _TOOL_PHASE_LABELS.get(phase, phase or "已更新")
                 name = str(item.get("name") or "tool")
+                if lines and lines[-1] != "":
+                    lines.append("")
                 lines.append(f"{idx}. **{cls._tool_display_name(name)}** - {status}")
-                args_preview = cls._format_json_preview(item.get("arguments"), max_chars=700)
+                args_preview = cls._format_tool_arguments_block(
+                    item.get("arguments"),
+                    max_value_chars=520,
+                )
                 if args_preview:
-                    lines.append("   - 参数:")
-                    lines.append(f"```json\n{args_preview}\n```\n")
+                    lines.append("")
+                    lines.append("**参数**")
+                    lines.append(f"```json\n{args_preview}\n```")
                 if item.get("error"):
-                    lines.append(f"   - 错误: `{cls._truncate_inline(item['error'], 260)}`")
+                    lines.append("")
+                    lines.append("**错误**")
+                    lines.append(f"- `{cls._truncate_inline(item['error'], 260)}`")
                 elif item.get("result") not in (None, "", {}, []):
                     result_preview = cls._format_json_preview(item["result"], max_chars=900)
                     result_lang = "" if isinstance(item["result"], str) else "json"
-                    lines.append("   - 结果:")
+                    lines.append("")
+                    lines.append("**结果**")
                     lines.append(f"```{result_lang}\n{result_preview}\n```\n")
                 files = item.get("files") if isinstance(item.get("files"), list) else []
                 embeds = item.get("embeds") if isinstance(item.get("embeds"), list) else []
                 if files or embeds:
-                    lines.append(f"   - 附件: {len(files)} 个文件，{len(embeds)} 个嵌入结果")
+                    lines.append("")
+                    lines.append("**附件**")
+                    lines.append(f"- {len(files)} 个文件，{len(embeds)} 个嵌入结果")
         else:
             lines.append("暂无工具调用。")
 
@@ -1774,7 +2110,7 @@ class FeishuChannel(BaseChannel):
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
         if isinstance(meta.get("_tool_events"), list):
-            buf = self._stream_bufs.get(stream_key)
+            buf = self._stream_buf_for_key(chat_id, stream_key)
             if buf is None:
                 buf = _FeishuStreamBuf()
                 self._stream_bufs[stream_key] = buf
@@ -1798,7 +2134,7 @@ class FeishuChannel(BaseChannel):
                     await self._add_reaction(message_id, self.config.done_emoji)
 
             if meta.get("_resuming"):
-                buf = self._stream_bufs.get(stream_key)
+                buf = self._stream_buf_for_key(chat_id, stream_key)
                 if not buf:
                     return
                 if buf.text.strip():
@@ -1811,6 +2147,8 @@ class FeishuChannel(BaseChannel):
                         buf.card_id,
                         buf.text,
                         buf.sequence,
+                        _STREAM_ELEMENT_ID,
+                        meta,
                     )
                     if ok:
                         buf.last_edit = time.monotonic()
@@ -1836,6 +2174,8 @@ class FeishuChannel(BaseChannel):
                         buf.card_id,
                         buf.text,
                         buf.sequence,
+                        _STREAM_ELEMENT_ID,
+                        meta,
                     )
                 if ok:
                     buf.sequence += 1
@@ -1852,57 +2192,31 @@ class FeishuChannel(BaseChannel):
                 )
             if not buf.text:
                 return
-            fallback_elements = self._build_card_elements(buf.text)
-            obs = self._format_observability_markdown(buf.tool_events, buf.token_usage)
-            if obs != _EMPTY_TOOL_LOGS_MARKDOWN:
-                fallback_elements.insert(0, {
-                    "tag": "collapsible_panel",
-                    "expanded": False,
-                    "background_color": "grey",
-                    "header": {
-                        "title": {"tag": "markdown", "content": "**工具调用详情**"},
-                        "background_color": "grey",
-                    },
-                    "border": {"color": "grey", "corner_radius": "5px"},
-                    "elements": [{
-                        "tag": "markdown",
-                        "content": obs,
-                        "text_size": _TOOL_LOGS_TEXT_SIZE,
-                    }],
-                })
-            if buf.token_usage:
-                fallback_elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
-                fallback_elements.append({
-                    "tag": "chart",
-                    "chart_spec": self._token_chart_spec(buf.token_usage),
-                    "element_id": _TOKEN_CHART_ELEMENT_ID,
-                    "color_theme": "complementary",
-                    "height": _TOKEN_CHART_HEIGHT,
-                    "margin": "0px 0px 0px 0px",
-                })
-            for chunk in self._split_elements_by_table_limit(fallback_elements):
-                card = json.dumps(
-                    {"config": {"wide_screen_mode": True}, "elements": chunk},
-                    ensure_ascii=False,
+            fallback_elements = self._build_markdown_card_elements(
+                buf.text,
+                tool_events=buf.tool_events,
+                token_usage=buf.token_usage,
+                metadata=meta,
+            )
+            card = json.dumps(self._build_card(fallback_elements, meta), ensure_ascii=False)
+            # Fallback replies stay in existing topics, but only create a
+            # new topic when reply-to-message is enabled.
+            fallback_msg_id = self._thread_reply_target(meta)
+            if fallback_msg_id:
+                await loop.run_in_executor(
+                    None, lambda: self._reply_message_sync(
+                        fallback_msg_id, "interactive", card,
+                        reply_in_thread=self._should_use_reply_in_thread(meta),
+                    ),
                 )
-                # Fallback replies stay in existing topics, but only create a
-                # new topic when reply-to-message is enabled.
-                fallback_msg_id = self._thread_reply_target(meta)
-                if fallback_msg_id:
-                    await loop.run_in_executor(
-                        None, lambda: self._reply_message_sync(
-                            fallback_msg_id, "interactive", card,
-                            reply_in_thread=self._should_use_reply_in_thread(meta),
-                        ),
-                    )
-                else:
-                    await loop.run_in_executor(
-                        None, self._send_message_sync, rid_type, chat_id, "interactive", card
-                    )
+            else:
+                await loop.run_in_executor(
+                    None, self._send_message_sync, rid_type, chat_id, "interactive", card
+                )
             return
 
         # --- accumulate delta ---
-        buf = self._stream_bufs.get(stream_key)
+        buf = self._stream_buf_for_key(chat_id, stream_key)
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[stream_key] = buf
@@ -1932,19 +2246,32 @@ class FeishuChannel(BaseChannel):
                         buf.token_usage,
                     ),
                     token_usage=buf.token_usage,
+                    metadata=meta,
                 ),
             )
             if card_id:
                 buf.card_id = card_id
                 buf.sequence = 1
                 await loop.run_in_executor(
-                    None, self._stream_update_text_sync, card_id, buf.text, 1
+                    None,
+                    self._stream_update_text_sync,
+                    card_id,
+                    buf.text,
+                    1,
+                    _STREAM_ELEMENT_ID,
+                    meta,
                 )
                 buf.last_edit = now
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
             buf.sequence += 1
             await loop.run_in_executor(
-                None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence
+                None,
+                self._stream_update_text_sync,
+                buf.card_id,
+                buf.text,
+                buf.sequence,
+                _STREAM_ELEMENT_ID,
+                meta,
             )
             buf.last_edit = now
 
@@ -2014,23 +2341,15 @@ class FeishuChannel(BaseChannel):
                 # Non-streaming fallback: use a small structured card instead
                 # of a raw English function-call line.
                 card = json.dumps(
-                    {"config": {"wide_screen_mode": True}, "elements": [
-                        {
-                            "tag": "collapsible_panel",
-                            "expanded": True,
-                            "background_color": "grey",
-                            "header": {
-                                "title": {"tag": "markdown", "content": "**工具调用详情**"},
-                                "background_color": "grey",
-                            },
-                            "border": {"color": "grey", "corner_radius": "5px"},
-                            "elements": [{
-                                "tag": "markdown",
-                                "content": f"**工具调用记录**\n\n- `{hint}`",
-                                "text_size": _TOOL_LOGS_TEXT_SIZE,
-                            }],
-                        },
-                    ]},
+                    self._build_card(
+                        [
+                            self._tool_observability_panel(
+                                f"**工具调用记录**\n\n- `{hint}`",
+                                expanded=True,
+                            ),
+                        ],
+                        msg.metadata,
+                    ),
                     ensure_ascii=False,
                 )
                 _th_msg_id = self._thread_reply_target(msg.metadata)
@@ -2043,7 +2362,12 @@ class FeishuChannel(BaseChannel):
                     )
                 else:
                     await loop.run_in_executor(
-                        None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "interactive",
+                        card,
                     )
                 return
 
@@ -2126,48 +2450,26 @@ class FeishuChannel(BaseChannel):
 
             if msg.content and msg.content.strip():
                 if final_buf and (final_buf.tool_events or final_buf.token_usage):
-                    elements = self._build_card_elements(msg.content)
-                    obs = self._format_observability_markdown(
-                        final_buf.tool_events,
-                        final_buf.token_usage,
+                    elements = self._build_markdown_card_elements(
+                        msg.content,
+                        tool_events=final_buf.tool_events,
+                        token_usage=final_buf.token_usage,
+                        metadata=msg.metadata,
                     )
-                    if obs != _EMPTY_TOOL_LOGS_MARKDOWN:
-                        elements.insert(0, {
-                            "tag": "collapsible_panel",
-                            "expanded": False,
-                            "background_color": "grey",
-                            "header": {
-                                "title": {"tag": "markdown", "content": "**工具调用详情**"},
-                                "background_color": "grey",
-                            },
-                            "border": {"color": "grey", "corner_radius": "5px"},
-                            "elements": [{
-                                "tag": "markdown",
-                                "content": obs,
-                                "text_size": _TOOL_LOGS_TEXT_SIZE,
-                            }],
-                        })
-                    if final_buf.token_usage:
-                        elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
-                        elements.append({
-                            "tag": "chart",
-                            "chart_spec": self._token_chart_spec(final_buf.token_usage),
-                            "element_id": _TOKEN_CHART_ELEMENT_ID,
-                            "color_theme": "complementary",
-                            "height": _TOKEN_CHART_HEIGHT,
-                            "margin": "0px 0px 0px 0px",
-                        })
-                    for chunk in self._split_elements_by_table_limit(elements):
-                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
-                            None,
-                            _do_send,
-                            "interactive",
-                            json.dumps(card, ensure_ascii=False),
-                        )
+                    card = self._build_card(elements, msg.metadata)
+                    await loop.run_in_executor(
+                        None,
+                        _do_send,
+                        "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    )
                     return
 
-                fmt = self._detect_msg_format(msg.content)
+                fmt = (
+                    "interactive"
+                    if self._source_label(msg.metadata)
+                    else self._detect_msg_format(msg.content)
+                )
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
@@ -2180,16 +2482,18 @@ class FeishuChannel(BaseChannel):
                     await loop.run_in_executor(None, _do_send, "post", post_body)
 
                 else:
-                    # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
-                    for chunk in self._split_elements_by_table_limit(elements):
-                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
-                            None,
-                            _do_send,
-                            "interactive",
-                            json.dumps(card, ensure_ascii=False),
-                        )
+                    # Complex / long content – send as a CardKit 2.0 markdown card.
+                    elements = self._build_markdown_card_elements(
+                        msg.content,
+                        metadata=msg.metadata,
+                    )
+                    card = self._build_card(elements, msg.metadata)
+                    await loop.run_in_executor(
+                        None,
+                        _do_send,
+                        "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    )
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)

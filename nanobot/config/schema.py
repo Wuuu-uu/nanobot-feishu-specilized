@@ -29,6 +29,7 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    send_autonomous_progress: bool = True  # show cron/helper model content progress cards
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
@@ -151,6 +152,12 @@ class AgentDefaults(Base):
         default=80,
         ge=0,
     )  # Extra recent messages retained on disk beyond maxMessages before raw archive/cold archive
+    active_context_archive_buffer_messages: int = Field(
+        default=100,
+        ge=0,
+        validation_alias=AliasChoices("activeContextArchiveBufferMessages"),
+        serialization_alias="activeContextArchiveBufferMessages",
+    )  # Messages excluded from active replay before summary-archiving to history.jsonl (0 = disabled)
     consolidation_ratio: float = Field(
         default=0.5,
         ge=0.1,

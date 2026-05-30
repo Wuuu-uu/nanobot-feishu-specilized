@@ -21,7 +21,7 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn", "exec"] = "agent_turn"
+    kind: Literal["system_event", "agent_turn", "agent_turn_with_context", "exec"] = "agent_turn"
     message: str = ""
     command: str = ""
     timeout_s: int | None = None
@@ -31,6 +31,12 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     channel_meta: dict = field(default_factory=dict)  # channel-specific routing (e.g. Slack thread_ts)
     session_key: str | None = None  # original session key for correct session recording
+    context_session_key: str | None = None  # main session the worker may read for context sync
+    sync_session_key: str | None = None  # session that receives lightweight cron status messages
+    worker_session_key: str | None = None  # independent cron worker session; defaults to cron:<job_id>
+    last_sync_message_timestamp: str | None = None
+    sync_max_messages: int = 12
+    sync_max_chars: int = 12000
 
 
 @dataclass

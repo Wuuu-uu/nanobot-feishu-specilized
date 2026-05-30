@@ -21,7 +21,9 @@ from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.autopilot_help import AutopilotHelpTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.cron_message import CronMessageTool
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.filesystem import (
@@ -251,6 +253,7 @@ class AgentLoop:
         consolidation_ratio: float = 0.5,
         max_messages: int = 120,
         session_archive_buffer_messages: int = 80,
+        active_context_archive_buffer_messages: int = 100,
         dream_cold_archive_older_than_days: int = 30,
         dream_allow_topic_edits: bool = True,
         hooks: list[AgentHook] | None = None,
@@ -363,6 +366,7 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
+            active_context_archive_buffer_messages=active_context_archive_buffer_messages,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -541,6 +545,21 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+            self.tools.register(
+                AutopilotHelpTool(
+                    loop=self,
+                    sessions=self.sessions,
+                    cron_service=self.cron_service,
+                    workspace=self.workspace,
+                )
+            )
+            self.tools.register(
+                CronMessageTool(
+                    sessions=self.sessions,
+                    cron_service=self.cron_service,
+                    workspace=self.workspace,
+                )
+            )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -589,11 +608,11 @@ class AgentLoop:
         )
         for name in (
             "message", "spawn", "cron", "my", "image_generate",
-            "session_manage", "long_task", "complete_goal",
+            "session_manage", "long_task", "complete_goal", "cron_message", "autopilot_help",
         ):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    if name in {"long_task", "complete_goal"}:
+                    if name in {"long_task", "complete_goal", "cron_message", "autopilot_help"}:
                         tool.set_context(request_ctx)
                     elif name == "spawn":
                         tool.set_context(channel, chat_id, effective_key=effective_key)
@@ -682,6 +701,13 @@ class AgentLoop:
         if isinstance(self.context_block_limit, int) and self.context_block_limit > 0:
             budget = min(budget, self.context_block_limit)
         return max(128, budget)
+
+    async def _maybe_archive_active_context_buffer(self, session: Session) -> None:
+        await self.consolidator.maybe_archive_active_context_buffer(
+            session,
+            max_tokens=self._replay_token_budget(),
+            safety_message_cap=self._history_safety_message_cap,
+        )
 
     async def _run_agent_loop(
         self,
@@ -922,7 +948,7 @@ class AgentLoop:
         try:
             async with lock, gate:
                 try:
-                    on_stream = on_stream_end = None
+                    on_progress = on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
                         # Split one answer into distinct stream segments.
                         stream_base_id = f"{msg.session_key}:{time.time_ns()}"
@@ -931,8 +957,17 @@ class AgentLoop:
                         def _current_stream_id() -> str:
                             return f"{stream_base_id}:{stream_segment}"
 
-                        async def on_stream(delta: str) -> None:
+                        def _stream_metadata() -> dict[str, Any]:
                             meta = dict(msg.metadata or {})
+                            if not (meta.get("_source_label") or meta.get("_cron_source_label")):
+                                meta["_source_title"] = "Main Session 消息"
+                                meta["_source_label"] = (
+                                    f"Main Session · sessions/{self.sessions.safe_key(session_key)}.jsonl"
+                                )
+                            return meta
+
+                        async def on_stream(delta: str) -> None:
+                            meta = _stream_metadata()
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
                             await self.bus.publish_outbound(OutboundMessage(
@@ -943,7 +978,7 @@ class AgentLoop:
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
-                            meta = dict(msg.metadata or {})
+                            meta = _stream_metadata()
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
                             meta["_stream_id"] = _current_stream_id()
@@ -952,10 +987,33 @@ class AgentLoop:
                                 content="",
                                 metadata=meta,
                             ))
-                            stream_segment += 1
+                            if not resuming:
+                                stream_segment += 1
+
+                        async def on_progress(
+                            content: str,
+                            *,
+                            tool_hint: bool = False,
+                            tool_events: list[dict[str, Any]] | None = None,
+                        ) -> None:
+                            meta = _stream_metadata()
+                            meta["_progress"] = True
+                            meta["_tool_hint"] = tool_hint
+                            meta["_stream_id"] = _current_stream_id()
+                            if tool_events:
+                                meta["_tool_events"] = tool_events
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=content,
+                                metadata=meta,
+                            ))
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_progress=on_progress,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
                     if response is not None:
@@ -1081,6 +1139,7 @@ class AgentLoop:
                 session,
                 session_summary=pending,
             )
+            await self._maybe_archive_active_context_buffer(session)
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
             # provider compatibility, which previously caused the follow-up to
@@ -1128,6 +1187,7 @@ class AgentLoop:
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(self._maybe_archive_active_context_buffer(session))
             # Reconstruct channel-specific metadata from session.key so the
             # outbound reply lands in the originating thread (not the channel
             # top-level). The announce InboundMessage carries only
@@ -1173,6 +1233,7 @@ class AgentLoop:
             session,
             session_summary=pending,
         )
+        await self._maybe_archive_active_context_buffer(session)
 
         self._set_tool_context(
             msg.channel, msg.chat_id, msg.metadata.get("message_id"),
@@ -1276,6 +1337,7 @@ class AgentLoop:
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        self._schedule_background(self._maybe_archive_active_context_buffer(session))
 
         # When follow-up messages were injected mid-turn, a later natural
         # language reply may address those follow-ups and should not be
@@ -1517,6 +1579,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1525,7 +1588,7 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            content=content, media=media or [], metadata=metadata or {},
         )
         return await self._process_message(
             msg,

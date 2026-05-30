@@ -90,6 +90,7 @@ class CronService:
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._timer_active = False
+        self._running_jobs: set[str] = set()
         self.max_sleep_ms = max_sleep_ms
 
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
@@ -141,6 +142,32 @@ class CronService:
                                 or {}
                             ),
                             session_key=j["payload"].get("sessionKey") or j["payload"].get("session_key"),
+                            context_session_key=(
+                                j["payload"].get("contextSessionKey")
+                                or j["payload"].get("context_session_key")
+                            ),
+                            sync_session_key=(
+                                j["payload"].get("syncSessionKey")
+                                or j["payload"].get("sync_session_key")
+                            ),
+                            worker_session_key=(
+                                j["payload"].get("workerSessionKey")
+                                or j["payload"].get("worker_session_key")
+                            ),
+                            last_sync_message_timestamp=(
+                                j["payload"].get("lastSyncMessageTimestamp")
+                                or j["payload"].get("last_sync_message_timestamp")
+                            ),
+                            sync_max_messages=int(
+                                j["payload"].get("syncMaxMessages")
+                                or j["payload"].get("sync_max_messages")
+                                or 12
+                            ),
+                            sync_max_chars=int(
+                                j["payload"].get("syncMaxChars")
+                                or j["payload"].get("sync_max_chars")
+                                or 12000
+                            ),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -227,7 +254,7 @@ class CronService:
           load (during ``start``) can return ``None`` to signal an unrecoverable
           state to the caller.
         """
-        if self._timer_active and self._store:
+        if (self._timer_active or self._running_jobs) and self._store:
             return self._store
         loaded = self._load_jobs()
         if loaded is None:
@@ -274,6 +301,12 @@ class CronService:
                         "to": j.payload.to,
                         "channelMeta": j.payload.channel_meta,
                         "sessionKey": j.payload.session_key,
+                        "contextSessionKey": j.payload.context_session_key,
+                        "syncSessionKey": j.payload.sync_session_key,
+                        "workerSessionKey": j.payload.worker_session_key,
+                        "lastSyncMessageTimestamp": j.payload.last_sync_message_timestamp,
+                        "syncMaxMessages": j.payload.sync_max_messages,
+                        "syncMaxChars": j.payload.sync_max_chars,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -361,12 +394,14 @@ class CronService:
             self._timer_task = None
 
     def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+        """Recompute missing or stale next run times for enabled jobs."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
+                if job.state.next_run_at_ms and job.state.next_run_at_ms > now:
+                    continue
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
@@ -425,9 +460,22 @@ class CronService:
             self._timer_active = False
         self._arm_timer()
 
-    async def _execute_job(self, job: CronJob) -> None:
+    async def _execute_job(self, job: CronJob) -> bool:
         """Execute a single job."""
         start_ms = _now_ms()
+        if job.id in self._running_jobs:
+            logger.warning("Cron: job '{}' ({}) is already running; skipping trigger", job.name, job.id)
+            self._record_job_run(
+                job,
+                run_at_ms=start_ms,
+                status="skipped",
+                duration_ms=0,
+                error="already running",
+            )
+            self._advance_job_schedule(job)
+            return False
+
+        self._running_jobs.add(job.id)
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
@@ -442,22 +490,50 @@ class CronService:
             job.state.last_status = "error"
             job.state.last_error = str(e)
             logger.error("Cron: job '{}' failed: {}", job.name, e)
+        finally:
+            self._running_jobs.discard(job.id)
 
         end_ms = _now_ms()
-        job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = end_ms
-
-        job.state.run_history.append(CronRunRecord(
+        self._record_job_run(
+            job,
             run_at_ms=start_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
+        )
+
+        self._advance_job_schedule(job)
+        return True
+
+    def _record_job_run(
+        self,
+        job: CronJob,
+        *,
+        run_at_ms: int,
+        status: Literal["ok", "error", "skipped"],
+        duration_ms: int,
+        error: str | None,
+    ) -> None:
+        """Record a job execution attempt, including skipped overlap triggers."""
+        job.state.last_run_at_ms = run_at_ms
+        job.state.last_status = status
+        job.state.last_error = error
+        job.updated_at_ms = _now_ms()
+        job.state.run_history.append(CronRunRecord(
+            run_at_ms=run_at_ms,
+            status=status,
+            duration_ms=duration_ms,
+            error=error,
         ))
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
+    def _advance_job_schedule(self, job: CronJob) -> None:
+        """Move a job to its post-attempt schedule state."""
         # Handle one-shot jobs
         if job.schedule.kind == "at":
-            if job.delete_after_run:
+            if job.state.last_status == "skipped":
+                job.state.next_run_at_ms = None
+            elif job.delete_after_run:
                 self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
             else:
                 job.enabled = False
@@ -486,7 +562,7 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str = "",
-        kind: Literal["system_event", "agent_turn", "exec"] = "agent_turn",
+        kind: Literal["system_event", "agent_turn", "agent_turn_with_context", "exec"] = "agent_turn",
         command: str = "",
         timeout_s: int | None = None,
         deliver: bool = False,
@@ -495,6 +571,12 @@ class CronService:
         delete_after_run: bool = False,
         channel_meta: dict | None = None,
         session_key: str | None = None,
+        context_session_key: str | None = None,
+        sync_session_key: str | None = None,
+        worker_session_key: str | None = None,
+        last_sync_message_timestamp: str | None = None,
+        sync_max_messages: int = 12,
+        sync_max_chars: int = 12000,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -509,6 +591,10 @@ class CronService:
             raise ValueError("message is required for non-exec cron jobs")
         if timeout_s is not None and timeout_s <= 0:
             raise ValueError("timeout_s must be > 0")
+        if sync_max_messages <= 0:
+            raise ValueError("sync_max_messages must be > 0")
+        if sync_max_chars <= 0:
+            raise ValueError("sync_max_chars must be > 0")
         now = _now_ms()
 
         job = CronJob(
@@ -526,6 +612,12 @@ class CronService:
                 to=to,
                 channel_meta=channel_meta or {},
                 session_key=session_key,
+                context_session_key=context_session_key,
+                sync_session_key=sync_session_key,
+                worker_session_key=worker_session_key,
+                last_sync_message_timestamp=last_sync_message_timestamp,
+                sync_max_messages=sync_max_messages,
+                sync_max_chars=sync_max_chars,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -608,7 +700,7 @@ class CronService:
         name: str | None = None,
         schedule: CronSchedule | None = None,
         message: str | None = None,
-        kind: Literal["agent_turn", "exec"] | None = None,
+        kind: Literal["agent_turn", "agent_turn_with_context", "exec"] | None = None,
         command: str | None = None,
         timeout_s: int | None = None,
         deliver: bool | None = None,
@@ -675,9 +767,9 @@ class CronService:
                 if job.id == job_id:
                     if not force and not job.enabled:
                         return False
-                    await self._execute_job(job)
+                    executed = await self._execute_job(job)
                     self._save_store()
-                    return True
+                    return executed
             return False
         finally:
             self._running = was_running

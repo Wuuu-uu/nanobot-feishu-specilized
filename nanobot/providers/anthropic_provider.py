@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import secrets
@@ -15,6 +16,10 @@ import json_repair
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _ALNUM = string.ascii_letters + string.digits
+_ANTHROPIC_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_TEMPERATURE_UNSUPPORTED_MODEL_TOKENS = ("opus-4-7", "opus-4-8")
+_ADAPTIVE_OUTPUT_CONFIG_MODEL_TOKENS = ("opus-4-8",)
+_OUTPUT_CONFIG_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 
 def _gen_tool_id() -> str:
@@ -114,6 +119,30 @@ class AnthropicProvider(LLMProvider):
             return model[len("anthropic/"):]
         return model
 
+    @staticmethod
+    def _matches_model_token(model: str, tokens: tuple[str, ...]) -> bool:
+        model_lower = model.lower()
+        return any(token in model_lower for token in tokens)
+
+    @classmethod
+    def _supports_temperature(cls, model: str) -> bool:
+        return not cls._matches_model_token(model, _TEMPERATURE_UNSUPPORTED_MODEL_TOKENS)
+
+    @classmethod
+    def _uses_output_config_effort(cls, model: str) -> bool:
+        return cls._matches_model_token(model, _ADAPTIVE_OUTPUT_CONFIG_MODEL_TOKENS)
+
+    @staticmethod
+    def _output_config_effort(reasoning_effort: str | None) -> str | None:
+        if not reasoning_effort:
+            return None
+        effort = reasoning_effort.lower()
+        if effort in {"none", "adaptive"}:
+            return None
+        if effort in _OUTPUT_CONFIG_EFFORTS:
+            return effort
+        return "medium"
+
     # ------------------------------------------------------------------
     # Message conversion: OpenAI chat format → Anthropic Messages API
     # ------------------------------------------------------------------
@@ -124,6 +153,7 @@ class AnthropicProvider(LLMProvider):
         """Return ``(system, anthropic_messages)``."""
         system: str | list[dict[str, Any]] = ""
         raw: list[dict[str, Any]] = []
+        tool_id_map: dict[str, str] = {}
 
         for msg in messages:
             role = msg.get("role", "")
@@ -134,7 +164,7 @@ class AnthropicProvider(LLMProvider):
                 continue
 
             if role == "tool":
-                block = self._tool_result_block(msg)
+                block = self._tool_result_block(msg, tool_id_map=tool_id_map)
                 if raw and raw[-1]["role"] == "user":
                     prev_c = raw[-1]["content"]
                     if isinstance(prev_c, list):
@@ -148,7 +178,10 @@ class AnthropicProvider(LLMProvider):
                 continue
 
             if role == "assistant":
-                raw.append({"role": "assistant", "content": self._assistant_blocks(msg)})
+                raw.append({
+                    "role": "assistant",
+                    "content": self._assistant_blocks(msg, tool_id_map=tool_id_map),
+                })
                 continue
 
             if role == "user":
@@ -161,22 +194,55 @@ class AnthropicProvider(LLMProvider):
         return system, self._merge_consecutive(raw)
 
     @staticmethod
-    def _tool_result_block(msg: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_tool_use_id(value: Any) -> str:
+        """Return an Anthropic-valid tool id while preserving valid ids.
+
+        Anthropic Messages requires ``tool_use.id`` and paired
+        ``tool_result.tool_use_id`` to match ``^[a-zA-Z0-9_-]+$``. Histories can
+        contain provider-specific ids such as OpenAI Responses
+        ``call_id|item_id``; those must be mapped consistently before replaying
+        the turn to Claude.
+        """
+        if isinstance(value, str) and value and _ANTHROPIC_TOOL_ID_RE.match(value):
+            return value
+        raw = str(value or "tool_call")
+        return "toolu_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _map_tool_use_id(cls, value: Any, tool_id_map: dict[str, str] | None = None) -> str:
+        if isinstance(value, str) and value:
+            if tool_id_map is not None:
+                return tool_id_map.setdefault(value, cls._normalize_tool_use_id(value))
+            return cls._normalize_tool_use_id(value)
+        return _gen_tool_id()
+
+    @classmethod
+    def _tool_result_block(
+        cls,
+        msg: dict[str, Any],
+        *,
+        tool_id_map: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id", ""),
+            "tool_use_id": cls._map_tool_use_id(msg.get("tool_call_id"), tool_id_map),
         }
         if isinstance(content, list):
-            block["content"] = AnthropicProvider._convert_user_content(content)
+            block["content"] = cls._convert_user_content(content)
         elif isinstance(content, str):
             block["content"] = content
         else:
             block["content"] = str(content) if content else ""
         return block
 
-    @staticmethod
-    def _assistant_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    @classmethod
+    def _assistant_blocks(
+        cls,
+        msg: dict[str, Any],
+        *,
+        tool_id_map: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
         content = msg.get("content")
 
@@ -192,7 +258,13 @@ class AnthropicProvider(LLMProvider):
             blocks.append({"type": "text", "text": content})
         elif isinstance(content, list):
             for item in content:
-                blocks.append(item if isinstance(item, dict) else {"type": "text", "text": str(item)})
+                if isinstance(item, dict):
+                    block = dict(item)
+                    if block.get("type") == "tool_use":
+                        block["id"] = cls._map_tool_use_id(block.get("id"), tool_id_map)
+                    blocks.append(block)
+                else:
+                    blocks.append({"type": "text", "text": str(item)})
 
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
@@ -203,7 +275,7 @@ class AnthropicProvider(LLMProvider):
                 args = json_repair.loads(args)
             blocks.append({
                 "type": "tool_use",
-                "id": tc.get("id") or _gen_tool_id(),
+                "id": cls._map_tool_use_id(tc.get("id"), tool_id_map),
                 "name": func.get("name", ""),
                 "input": args,
             })
@@ -436,9 +508,9 @@ class AnthropicProvider(LLMProvider):
         max_tokens = max(1, max_tokens)
         thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
 
-        # claude-opus-4-7 deprecated the `temperature` parameter entirely — the
-        # API returns 400 if it is present, on any code path.
-        omit_temperature = "opus-4-7" in model_name
+        # Newer Opus 4.x variants reject the `temperature` parameter entirely
+        # on some Anthropic-compatible gateways, on any code path.
+        omit_temperature = not self._supports_temperature(model_name)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -449,7 +521,16 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        if reasoning_effort == "adaptive":
+        if thinking_enabled and self._uses_output_config_effort(model_name):
+            # claude-opus-4-8 rejects legacy budgeted thinking:
+            #   {"type": "enabled", "budget_tokens": ...}
+            # and asks for adaptive thinking plus output_config.effort.
+            kwargs["thinking"] = {"type": "adaptive"}
+            if effort := self._output_config_effort(reasoning_effort):
+                kwargs["output_config"] = {"effort": effort}
+            if not omit_temperature:
+                kwargs["temperature"] = 1.0
+        elif reasoning_effort == "adaptive":
             # Adaptive thinking: model decides when and how much to think
             # Supported on claude-sonnet-4-6 and claude-opus-4-6.
             # Also auto-enables interleaved thinking between tool calls.
