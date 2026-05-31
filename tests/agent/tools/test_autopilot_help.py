@@ -140,6 +140,9 @@ async def test_autopilot_help_syncs_main_context_and_publishes_helper_card(tmp_p
     assert "Decision: revise" in out
     assert "valid JSON object" in loop.calls[0]["content"]
     assert "no markdown fences" in loop.calls[0]["content"]
+    assert "default job is to make the best bounded autonomous decision" in loop.calls[0]["content"]
+    assert "Choose decision: human_required only when no safe autonomous option remains" in loop.calls[0]["content"]
+    assert '"human_note": "..."' in loop.calls[0]["content"]
     assert "Helper Agent 消息" in loop.calls[0]["metadata"]["_source_title"]
     assert loop.calls[0]["metadata"]["_source_label"].startswith("Helper · sessions/helper_")
     assert loop.calls[0]["metadata"]["_stream_id"].startswith("helper:")

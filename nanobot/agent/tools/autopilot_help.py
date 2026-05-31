@@ -406,7 +406,18 @@ class AutopilotHelpTool(Tool):
             "synchronized from the main user session; do not rely on old helper-session state. "
             "Review the worker request critically and help it escape local loops, weak ideas, "
             "or unresolved blockers. Do not perform broad experiments or destructive actions. "
-            "If the issue needs the human user, choose decision: human_required.\n\n"
+            "Your default job is to make the best bounded autonomous decision, not to ask the "
+            "human to decide. Prefer approve, revise, reject, or need_more_info with an executable "
+            "next action whenever the action is bounded, reversible, already within the user's "
+            "research direction, or can be validated by a small evidence-gathering step. Choose "
+            "decision: human_required only when no safe autonomous option remains because the next "
+            "step needs explicit user preference, substantial cost/compute expansion, credential "
+            "or secret handling, destructive cleanup, production promotion, commit/push, policy "
+            "boundary changes, or a major research-direction change.\n\n"
+            "When uncertain, do not escalate by default: either revise the plan with stricter "
+            "acceptance criteria, reject the weak option and name a better one, or request the "
+            "minimal missing evidence through need_more_info. If you choose human_required, explain "
+            "why each bounded autonomous alternative is insufficient.\n\n"
             "Your final answer must be exactly one valid JSON object, with no markdown fences, "
             "no prose before it, and no prose after it. Use this shape:\n"
             "{\n"
@@ -414,7 +425,8 @@ class AutopilotHelpTool(Tool):
             '  "reason": ["..."],\n'
             '  "next_action": {"summary": "...", "steps": ["..."]},\n'
             '  "stop_or_acceptance_criteria": ["..."],\n'
-            '  "required_evidence": ["..."]\n'
+            '  "required_evidence": ["..."],\n'
+            '  "human_note": "..."\n'
             "}\n"
             "Omit optional keys only when they do not apply.\n\n"
             f"Request log: {request_path}\n\n"

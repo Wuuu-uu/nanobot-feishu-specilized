@@ -143,6 +143,63 @@ class TestDeltaCoalescing:
         assert pending[0].content == "World"
 
     @pytest.mark.asyncio
+    async def test_deltas_same_chat_different_stream_ids_not_coalesced(self, manager, bus):
+        """Concurrent streams to one chat must not be merged into one card."""
+        await bus.publish_outbound(OutboundMessage(
+            channel="mock",
+            chat_id="chat1",
+            content="main-",
+            metadata={"_stream_delta": True, "_stream_id": "main:1"},
+        ))
+        await bus.publish_outbound(OutboundMessage(
+            channel="mock",
+            chat_id="chat1",
+            content="cron-",
+            metadata={"_stream_delta": True, "_stream_id": "cron:1"},
+        ))
+        await bus.publish_outbound(OutboundMessage(
+            channel="mock",
+            chat_id="chat1",
+            content="reply",
+            metadata={"_stream_delta": True, "_stream_id": "main:1"},
+        ))
+
+        first_msg = await bus.consume_outbound()
+        merged, pending = manager._coalesce_stream_deltas(first_msg)
+
+        assert merged.content == "main-"
+        assert merged.metadata["_stream_id"] == "main:1"
+        assert len(pending) == 1
+        assert pending[0].content == "cron-"
+        assert pending[0].metadata["_stream_id"] == "cron:1"
+
+        remaining = await bus.consume_outbound()
+        assert remaining.content == "reply"
+        assert remaining.metadata["_stream_id"] == "main:1"
+
+    @pytest.mark.asyncio
+    async def test_deltas_same_chat_same_stream_id_still_coalesced(self, manager, bus):
+        await bus.publish_outbound(OutboundMessage(
+            channel="mock",
+            chat_id="chat1",
+            content="main-",
+            metadata={"_stream_delta": True, "_stream_id": "main:1"},
+        ))
+        await bus.publish_outbound(OutboundMessage(
+            channel="mock",
+            chat_id="chat1",
+            content="reply",
+            metadata={"_stream_delta": True, "_stream_id": "main:1"},
+        ))
+
+        first_msg = await bus.consume_outbound()
+        merged, pending = manager._coalesce_stream_deltas(first_msg)
+
+        assert merged.content == "main-reply"
+        assert merged.metadata["_stream_id"] == "main:1"
+        assert pending == []
+
+    @pytest.mark.asyncio
     async def test_stream_end_terminates_coalescing(self, manager, bus):
         """_stream_end should stop coalescing and be included in final message."""
         # Put deltas with stream_end at the end
