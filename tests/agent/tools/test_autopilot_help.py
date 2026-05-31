@@ -124,6 +124,7 @@ async def test_autopilot_help_syncs_main_context_and_publishes_helper_card(tmp_p
             chat_id="ou_123",
             session_key="cron:complex-reasoning-autopilot",
             metadata={
+                "_context_profile": "autopilot_worker",
                 "_autopilot_sync_session_key": "feishu:ou_123:main",
                 "_autopilot_worker_session_key": "cron:complex-reasoning-autopilot",
             },
@@ -145,6 +146,7 @@ async def test_autopilot_help_syncs_main_context_and_publishes_helper_card(tmp_p
     assert '"human_note": "..."' in loop.calls[0]["content"]
     assert "Helper Agent 消息" in loop.calls[0]["metadata"]["_source_title"]
     assert loop.calls[0]["metadata"]["_source_label"].startswith("Helper · sessions/helper_")
+    assert loop.calls[0]["metadata"]["_context_profile"] == "autopilot_helper"
     assert loop.calls[0]["metadata"]["_stream_id"].startswith("helper:")
     assert [m["content"] for m in loop.calls[0]["helper_messages"]] == [
         "主会话里的研究目标",

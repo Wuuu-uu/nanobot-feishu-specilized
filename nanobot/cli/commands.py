@@ -49,7 +49,7 @@ class SafeFileHistory(FileHistory):
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.utils.helpers import safe_filename, sync_workspace_templates
 from nanobot.utils.restart import (
     consume_restart_notice_from_env,
     format_restart_completed_message,
@@ -820,6 +820,32 @@ def _run_gateway(
         }
         session_manager.save(session)
 
+    def _infer_autopilot_research_id(job: CronJob, worker_key: str) -> str:
+        if getattr(job.payload, "research_id", None):
+            return safe_filename(str(job.payload.research_id))
+        meta = job.payload.channel_meta or {}
+        if meta.get("_research_id") or meta.get("research_id"):
+            return safe_filename(str(meta.get("_research_id") or meta.get("research_id")))
+
+        candidates = []
+        if job.name:
+            candidates.append(safe_filename(job.name))
+        if worker_key:
+            candidates.append(safe_filename(worker_key.replace(":", "_")))
+
+        research_root = config.workspace_path / "research"
+        for candidate in candidates:
+            if candidate and (research_root / candidate).is_dir():
+                return candidate
+
+        if job.name and job.name.startswith("complex-reasoning-") and (research_root / "complex-reasoning").is_dir():
+            return "complex-reasoning"
+
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return safe_filename(job.id)
+
     def _latest_cron_sync_timestamp(session_key: str, worker_rel: str) -> str | None:
         if not session_manager.session_exists(session_key):
             return None
@@ -923,6 +949,7 @@ def _run_gateway(
             sync_record_prefix = f"[From Cron Agent Session: {worker_rel}]\n\n"
             source_label = f"Cron · {worker_rel}"
             pre_sync_timestamp = _latest_cron_sync_timestamp(sync_key, worker_rel)
+            research_id = _infer_autopilot_research_id(job, worker_key)
 
             autonomous_note = (
                 "[Autonomous Cron Agent Turn]\n"
@@ -996,6 +1023,8 @@ def _run_gateway(
             turn_metadata["_autopilot_worker_session_key"] = worker_key
             turn_metadata["_autopilot_job_id"] = job.id
             turn_metadata["_autopilot_job_name"] = job.name
+            turn_metadata["_autopilot_research_id"] = research_id
+            turn_metadata["_context_profile"] = "autopilot_worker"
             wants_stream = bool(
                 job.payload.to
                 and _channel_streaming_enabled(job.payload.channel or "cli", turn_metadata)

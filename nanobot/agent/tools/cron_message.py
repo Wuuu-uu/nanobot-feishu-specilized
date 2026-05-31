@@ -184,15 +184,24 @@ class CronMessageTool(Tool):
             "Use cron_message(action='list') to inspect target ids."
         )
 
-    @staticmethod
-    def _infer_research_id(job: CronJob | None, worker_key: str, explicit: str) -> str:
+    def _infer_research_id(self, job: CronJob | None, worker_key: str, explicit: str) -> str:
         if explicit:
             return safe_filename(explicit)
+        if job and job.payload.research_id:
+            return safe_filename(job.payload.research_id)
         if job and job.name == "complex-reasoning-workflow-autonomous-iteration":
             return "complex-reasoning"
+        if job and job.name and job.name.startswith("complex-reasoning-"):
+            candidate = self._workspace / "research" / "complex-reasoning"
+            if candidate.is_dir():
+                return "complex-reasoning"
         if job and job.name:
-            return safe_filename(job.name)
-        return safe_filename(worker_key.replace(":", "_"))
+            candidate = safe_filename(job.name)
+            if candidate and (self._workspace / "research" / candidate).is_dir():
+                return candidate
+            return candidate
+        worker_candidate = safe_filename(worker_key.replace(":", "_"))
+        return worker_candidate
 
     def _append_guidance(
         self,

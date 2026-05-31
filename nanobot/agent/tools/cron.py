@@ -47,6 +47,10 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "Optional for kind='agent_turn_with_context': independent worker session key. "
         "Defaults to cron:<job_id>. Do not set this to the main/session sync key."
     ),
+    research_id=StringSchema(
+        "Optional for kind='agent_turn_with_context': workspace/research/<id> state directory "
+        "used by the autonomous worker profile. Defaults to the job name or worker key."
+    ),
     sync_max_messages=IntegerSchema(
         12,
         description="Legacy compatibility field for older context-sync jobs; ignored by new cron workers.",
@@ -196,6 +200,7 @@ class CronTool(Tool):
         context_session_key: str | None = None,
         sync_session_key: str | None = None,
         worker_session_key: str | None = None,
+        research_id: str | None = None,
         sync_max_messages: int = 12,
         sync_max_chars: int = 12000,
         **kwargs: Any,
@@ -217,6 +222,7 @@ class CronTool(Tool):
                 context_session_key=context_session_key,
                 sync_session_key=sync_session_key,
                 worker_session_key=worker_session_key,
+                research_id=research_id,
                 sync_max_messages=sync_max_messages,
                 sync_max_chars=sync_max_chars,
             )
@@ -246,6 +252,7 @@ class CronTool(Tool):
         context_session_key: str | None = None,
         sync_session_key: str | None = None,
         worker_session_key: str | None = None,
+        research_id: str | None = None,
         sync_max_messages: int = 12,
         sync_max_chars: int = 12000,
     ) -> str:
@@ -324,14 +331,15 @@ class CronTool(Tool):
         context_key = (context_session_key or "").strip() or None
         sync_key = (sync_session_key or "").strip() or None
         worker_key = (worker_session_key or "").strip() or None
+        research_key = (research_id or "").strip() or None
         if payload_kind == "agent_turn_with_context":
             context_key = context_key or current_session_key
             sync_key = sync_key or context_key
             if worker_key and worker_key in {context_key, sync_key}:
                 return "Error: worker_session_key must be independent from context/sync session keys"
-        elif any([context_key, sync_key, worker_key]):
+        elif any([context_key, sync_key, worker_key, research_key]):
             return (
-                "Error: context_session_key, sync_session_key, and worker_session_key "
+                "Error: context_session_key, sync_session_key, worker_session_key, and research_id "
                 "are only valid with kind='agent_turn_with_context'"
             )
 
@@ -351,6 +359,7 @@ class CronTool(Tool):
             context_session_key=context_key,
             sync_session_key=sync_key,
             worker_session_key=worker_key,
+            research_id=research_key,
             sync_max_messages=sync_max_messages,
             sync_max_chars=sync_max_chars,
         )

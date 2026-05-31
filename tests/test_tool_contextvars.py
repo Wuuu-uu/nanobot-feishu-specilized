@@ -227,6 +227,7 @@ async def test_cron_tool_context_job_defaults_to_current_session(tmp_path) -> No
         kind="agent_turn_with_context",
         message="monitor progress",
         every_seconds=1800,
+        research_id="demo-research",
     )
 
     assert result.startswith("Created job")
@@ -239,6 +240,7 @@ async def test_cron_tool_context_job_defaults_to_current_session(tmp_path) -> No
     assert job.payload.context_session_key == "feishu:ou_123:main"
     assert job.payload.sync_session_key == "feishu:ou_123:main"
     assert job.payload.worker_session_key is None
+    assert job.payload.research_id == "demo-research"
 
 
 @pytest.mark.asyncio

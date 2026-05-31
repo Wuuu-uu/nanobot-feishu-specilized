@@ -138,6 +138,97 @@ def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
     assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]", prompt)
 
 
+def test_autopilot_profile_injects_research_state_without_recent_history(tmp_path) -> None:
+    """Autopilot workers should use project state instead of global recent history."""
+    workspace = _make_workspace(tmp_path)
+    skill_dir = workspace / "skills" / "research-autopilot"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: research-autopilot\ndescription: test\n---\n\n# Research Autopilot\n\nSense, decide, act.",
+        encoding="utf-8",
+    )
+    research_dir = workspace / "research" / "demo-project"
+    research_dir.mkdir(parents=True)
+    (research_dir / "state.md").write_text("Durable project goal: improve validator gates.", encoding="utf-8")
+    (research_dir / "handoff.md").write_text("Next wake-up should inspect latest panel.", encoding="utf-8")
+    (research_dir / "inbox.jsonl").write_text(
+        '{"priority":"high","message":"Use cron_message guidance only."}\n',
+        encoding="utf-8",
+    )
+    builder = ContextBuilder(workspace)
+    builder.memory.append_history("main session chatter that should not enter autopilot prompt")
+
+    prompt = builder.build_system_prompt(
+        context_profile="autopilot_worker",
+        context_metadata={
+            "_autopilot_research_id": "demo-project",
+            "_autopilot_job_name": "demo-job",
+            "_autopilot_worker_session_key": "cron:demo",
+        },
+    )
+
+    assert "# Research Autopilot Operating Skill" in prompt
+    assert "Sense, decide, act." in prompt
+    assert "# Autopilot Research State" in prompt
+    assert "Research ID: demo-project" in prompt
+    assert "Durable project goal: improve validator gates." in prompt
+    assert "Next wake-up should inspect latest panel." in prompt
+    assert "Use cron_message guidance only." in prompt
+    assert "# Recent History" not in prompt
+    assert "main session chatter" not in prompt
+
+
+def test_helper_profile_uses_memory_and_helper_skill_without_bootstrap_or_research_state(tmp_path) -> None:
+    """Helper agents should keep main-session history, but use a lean system prompt."""
+    workspace = _make_workspace(tmp_path)
+    (workspace / "AGENTS.md").write_text("BOOTSTRAP SHOULD NOT APPEAR", encoding="utf-8")
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "memory" / "MEMORY.md").write_text(
+        "# Long-term Memory\n\nHelper memory fact.", encoding="utf-8"
+    )
+    helper_skill_dir = workspace / "skills" / "research-autopilot-helper"
+    helper_skill_dir.mkdir(parents=True)
+    (helper_skill_dir / "SKILL.md").write_text(
+        (
+            "---\n"
+            "name: research-autopilot-helper\n"
+            "description: test helper skill\n"
+            "---\n\n"
+            "# Research Autopilot Helper\n\n"
+            "Return strict JSON decisions."
+        ),
+        encoding="utf-8",
+    )
+    other_skill_dir = workspace / "skills" / "unrelated-skill"
+    other_skill_dir.mkdir(parents=True)
+    (other_skill_dir / "SKILL.md").write_text(
+        "---\nname: unrelated-skill\ndescription: SHOULD NOT APPEAR\n---\n\nOther skill body.",
+        encoding="utf-8",
+    )
+    research_dir = workspace / "research" / "demo-project"
+    research_dir.mkdir(parents=True)
+    (research_dir / "state.md").write_text("RESEARCH STATE SHOULD NOT APPEAR", encoding="utf-8")
+    builder = ContextBuilder(workspace)
+    builder.memory.append_history("recent global history should not enter helper prompt")
+
+    prompt = builder.build_system_prompt(
+        context_profile="autopilot_helper",
+        context_metadata={"_autopilot_research_id": "demo-project"},
+    )
+
+    assert "# Memory" in prompt
+    assert "Helper memory fact." in prompt
+    assert "# Research Autopilot Helper Operating Skill" in prompt
+    assert "Return strict JSON decisions." in prompt
+    assert "BOOTSTRAP SHOULD NOT APPEAR" not in prompt
+    assert "SHOULD NOT APPEAR" not in prompt
+    assert "Other skill body." not in prompt
+    assert "# Recent History" not in prompt
+    assert "recent global history" not in prompt
+    assert "# Autopilot Research State" not in prompt
+    assert "RESEARCH STATE SHOULD NOT APPEAR" not in prompt
+
+
 def test_recent_history_capped_at_max(tmp_path) -> None:
     """Only the most recent _MAX_RECENT_HISTORY entries are injected."""
     workspace = _make_workspace(tmp_path)

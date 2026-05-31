@@ -60,6 +60,39 @@ async def test_cron_message_injects_guidance_into_linked_worker(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cron_message_uses_existing_complex_reasoning_research_dir(tmp_path):
+    sessions = SessionManager(tmp_path)
+    cron = CronService(tmp_path / "cron" / "jobs.json")
+    (tmp_path / "research" / "complex-reasoning").mkdir(parents=True)
+    cron.add_job(
+        name="complex-reasoning-prompt-alignment-autopilot",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="wake up",
+        kind="agent_turn_with_context",
+        deliver=True,
+        session_key="feishu:ou_123:main",
+        context_session_key="feishu:ou_123:main",
+        sync_session_key="feishu:ou_123:main",
+        worker_session_key="cron:complex-reasoning-prompt-alignment-autopilot",
+    )
+
+    tool = CronMessageTool(sessions=sessions, cron_service=cron, workspace=tmp_path)
+    tool.set_context(
+        RequestContext(
+            channel="feishu",
+            chat_id="ou_123",
+            session_key="feishu:ou_123:main",
+        )
+    )
+
+    await tool.execute(action="send", message="下一轮验收 panel。", priority="high")
+
+    inbox = tmp_path / "research" / "complex-reasoning" / "inbox.jsonl"
+    assert inbox.exists()
+    assert "下一轮验收 panel" in inbox.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
 async def test_cron_message_requires_target_when_ambiguous(tmp_path):
     sessions = SessionManager(tmp_path)
     cron = CronService(tmp_path / "cron" / "jobs.json")

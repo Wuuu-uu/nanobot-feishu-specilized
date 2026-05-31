@@ -34,6 +34,7 @@ class CronPayload:
     context_session_key: str | None = None  # main session the worker may read for context sync
     sync_session_key: str | None = None  # session that receives lightweight cron status messages
     worker_session_key: str | None = None  # independent cron worker session; defaults to cron:<job_id>
+    research_id: str | None = None  # workspace/research/<id> state directory for autonomous workers
     last_sync_message_timestamp: str | None = None
     sync_max_messages: int = 12
     sync_max_chars: int = 12000

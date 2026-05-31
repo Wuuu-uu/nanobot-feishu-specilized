@@ -154,6 +154,10 @@ class CronService:
                                 j["payload"].get("workerSessionKey")
                                 or j["payload"].get("worker_session_key")
                             ),
+                            research_id=(
+                                j["payload"].get("researchId")
+                                or j["payload"].get("research_id")
+                            ),
                             last_sync_message_timestamp=(
                                 j["payload"].get("lastSyncMessageTimestamp")
                                 or j["payload"].get("last_sync_message_timestamp")
@@ -304,6 +308,7 @@ class CronService:
                         "contextSessionKey": j.payload.context_session_key,
                         "syncSessionKey": j.payload.sync_session_key,
                         "workerSessionKey": j.payload.worker_session_key,
+                        "researchId": j.payload.research_id,
                         "lastSyncMessageTimestamp": j.payload.last_sync_message_timestamp,
                         "syncMaxMessages": j.payload.sync_max_messages,
                         "syncMaxChars": j.payload.sync_max_chars,
@@ -574,6 +579,7 @@ class CronService:
         context_session_key: str | None = None,
         sync_session_key: str | None = None,
         worker_session_key: str | None = None,
+        research_id: str | None = None,
         last_sync_message_timestamp: str | None = None,
         sync_max_messages: int = 12,
         sync_max_chars: int = 12000,
@@ -615,6 +621,7 @@ class CronService:
                 context_session_key=context_session_key,
                 sync_session_key=sync_session_key,
                 worker_session_key=worker_session_key,
+                research_id=research_id,
                 last_sync_message_timestamp=last_sync_message_timestamp,
                 sync_max_messages=sync_max_messages,
                 sync_max_chars=sync_max_chars,

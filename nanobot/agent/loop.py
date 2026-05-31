@@ -1171,6 +1171,8 @@ class AgentLoop:
                 current_role=current_role,
                 sender_id=msg.sender_id,
                 session_metadata=session.metadata,
+                context_profile=msg.metadata.get("_context_profile"),
+                context_metadata=msg.metadata,
             )
             final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -1259,6 +1261,8 @@ class AgentLoop:
             chat_id=self._runtime_chat_id(msg),
             sender_id=msg.sender_id,
             session_metadata=session.metadata,
+            context_profile=msg.metadata.get("_context_profile"),
+            context_metadata=msg.metadata,
         )
 
         async def _bus_progress(

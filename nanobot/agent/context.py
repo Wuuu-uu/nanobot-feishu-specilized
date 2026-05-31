@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.goal_state import goal_state_runtime_lines
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, truncate_text
+from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, safe_filename, truncate_text
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -23,6 +23,23 @@ class ContextBuilder:
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+    _AUTOPILOT_PROFILE = "autopilot_worker"
+    _HELPER_PROFILE = "autopilot_helper"
+    _AUTOPILOT_RESEARCH_MAX_CHARS = 64_000
+    _AUTOPILOT_TEXT_FILES: tuple[tuple[str, int], ...] = (
+        ("handoff.md", 12_000),
+        ("state.md", 12_000),
+        ("repo_status.md", 8_000),
+        ("current_status.md", 8_000),
+        ("status.md", 8_000),
+        ("policy.md", 8_000),
+    )
+    _AUTOPILOT_JSONL_FILES: tuple[tuple[str, int, int], ...] = (
+        ("inbox.jsonl", 30, 16_000),
+        ("experiments.jsonl", 30, 16_000),
+        ("ideas.jsonl", 30, 12_000),
+        ("ledger.jsonl", 40, 12_000),
+    )
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
         self.workspace = workspace
@@ -35,8 +52,23 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
+        context_profile: str | None = None,
+        context_metadata: Mapping[str, Any] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        if context_profile == self._AUTOPILOT_PROFILE:
+            return self._build_autopilot_system_prompt(
+                skill_names=skill_names,
+                channel=channel,
+                session_summary=session_summary,
+                context_metadata=context_metadata,
+            )
+        if context_profile == self._HELPER_PROFILE:
+            return self._build_helper_system_prompt(
+                channel=channel,
+                session_summary=session_summary,
+            )
+
         parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files()
@@ -70,6 +102,155 @@ class ContextBuilder:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
+
+    def _build_helper_system_prompt(
+        self,
+        *,
+        channel: str | None = None,
+        session_summary: str | None = None,
+    ) -> str:
+        """Build a lean prompt for autopilot helper decision agents."""
+        parts = [self._get_identity(channel=channel)]
+
+        memory = self.memory.get_memory_context()
+        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n{memory}")
+
+        helper_skill = self.skills.load_skill("research-autopilot-helper")
+        if helper_skill:
+            parts.append(
+                "# Research Autopilot Helper Operating Skill\n\n"
+                + self.skills._strip_frontmatter(helper_skill)
+            )
+
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
+        return "\n\n---\n\n".join(parts)
+
+    def _build_autopilot_system_prompt(
+        self,
+        *,
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        context_metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Build a project-state-first prompt for autonomous cron workers."""
+        parts = [self._get_identity(channel=channel)]
+
+        bootstrap = self._load_bootstrap_files()
+        if bootstrap:
+            parts.append(bootstrap)
+
+        memory = self.memory.get_memory_context()
+        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+            parts.append(f"# Memory\n\n{memory}")
+
+        always_skills = self.skills.get_always_skills()
+        if always_skills:
+            always_content = self.skills.load_skills_for_context(always_skills)
+            if always_content:
+                parts.append(f"# Active Skills\n\n{always_content}")
+
+        autopilot_skill = self.skills.load_skill("research-autopilot")
+        if autopilot_skill:
+            parts.append(
+                "# Research Autopilot Operating Skill\n\n"
+                + self.skills._strip_frontmatter(autopilot_skill)
+            )
+
+        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
+        if skills_summary:
+            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        research_context = self._build_autopilot_research_context(context_metadata or {})
+        if research_context:
+            parts.append("# Autopilot Research State\n\n" + research_context)
+
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
+        return "\n\n---\n\n".join(parts)
+
+    def _build_autopilot_research_context(self, metadata: Mapping[str, Any]) -> str:
+        research_id = str(metadata.get("_autopilot_research_id") or "").strip()
+        if not research_id:
+            return (
+                "Research ID: not configured\n"
+                "No workspace research-state directory was injected for this cron worker. "
+                "Use cron_message or the scheduled objective to locate project state if needed."
+            )
+
+        safe_id = safe_filename(research_id)
+        if not safe_id:
+            return f"Research ID: {research_id}\nResearch state unavailable: invalid safe id."
+
+        research_dir = (self.workspace / "research" / safe_id).resolve()
+        research_root = (self.workspace / "research").resolve()
+        try:
+            research_dir.relative_to(research_root)
+        except ValueError:
+            return f"Research ID: {safe_id}\nResearch state unavailable: invalid path."
+
+        lines = [
+            f"Research ID: {safe_id}",
+            f"Research directory: {research_dir}",
+            "Main-session context is not auto-synchronized. Treat cron_message/inbox entries as the only explicit user steering channel.",
+        ]
+        if metadata.get("_autopilot_job_name"):
+            lines.append(f"Cron job: {metadata['_autopilot_job_name']}")
+        if metadata.get("_autopilot_worker_session_key"):
+            lines.append(f"Worker session: {metadata['_autopilot_worker_session_key']}")
+
+        if not research_dir.exists():
+            lines.append("Research state directory does not exist yet.")
+            return "\n".join(lines)
+
+        files = [p.name for p in sorted(research_dir.iterdir()) if p.is_file()]
+        if files:
+            preview = ", ".join(files[:40])
+            if len(files) > 40:
+                preview += f", ... (+{len(files) - 40} more)"
+            lines.append(f"Available state files: {preview}")
+
+        sections: list[str] = []
+        for filename, max_chars in self._AUTOPILOT_TEXT_FILES:
+            path = research_dir / filename
+            if not path.is_file():
+                continue
+            content = self._read_research_text(path, max_chars=max_chars)
+            if content:
+                sections.append(f"## {filename}\n\n{content}")
+
+        for filename, max_lines, max_chars in self._AUTOPILOT_JSONL_FILES:
+            path = research_dir / filename
+            if not path.is_file():
+                continue
+            content = self._read_research_jsonl_tail(path, max_lines=max_lines, max_chars=max_chars)
+            if content:
+                sections.append(f"## {filename} (recent entries)\n\n```jsonl\n{content}\n```")
+
+        if sections:
+            lines.append("\n\n".join(sections))
+        return truncate_text("\n\n".join(lines), self._AUTOPILOT_RESEARCH_MAX_CHARS)
+
+    @staticmethod
+    def _read_research_text(path: Path, *, max_chars: int) -> str:
+        try:
+            return truncate_text(path.read_text(encoding="utf-8", errors="replace").strip(), max_chars)
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _read_research_jsonl_tail(path: Path, *, max_lines: int, max_chars: int) -> str:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = [line for line in raw.splitlines() if line.strip()]
+        text = "\n".join(lines[-max_lines:])
+        return truncate_text(text, max_chars)
 
     def _get_identity(self, channel: str | None = None) -> str:
         """Get the core identity section."""
@@ -147,6 +328,8 @@ class ContextBuilder:
         session_summary: str | None = None,
         sender_id: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        context_profile: str | None = None,
+        context_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
@@ -172,6 +355,8 @@ class ContextBuilder:
                     skill_names,
                     channel=channel,
                     session_summary=session_summary,
+                    context_profile=context_profile,
+                    context_metadata=context_metadata,
                 ),
             },
             *history,

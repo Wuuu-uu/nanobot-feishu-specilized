@@ -392,6 +392,7 @@ class AutopilotHelpTool(Tool):
                 "_source_label": f"Helper · {helper_rel}",
                 "_helper_source_session": helper_rel,
                 "_autopilot_helper_active": True,
+                "_context_profile": "autopilot_helper",
                 "_stream_id": f"helper:{request_id}",
             }
         )

@@ -80,6 +80,7 @@ def test_add_context_agent_job_preserves_sync_fields(tmp_path) -> None:
         context_session_key="feishu:ou_123:main",
         sync_session_key="feishu:ou_123:main",
         worker_session_key="cron:research",
+        research_id="complex-reasoning",
         last_sync_message_timestamp="2026-05-21T01:00:00",
         sync_max_messages=7,
         sync_max_chars=9000,
@@ -95,6 +96,7 @@ def test_add_context_agent_job_preserves_sync_fields(tmp_path) -> None:
     assert reloaded.payload.context_session_key == "feishu:ou_123:main"
     assert reloaded.payload.sync_session_key == "feishu:ou_123:main"
     assert reloaded.payload.worker_session_key == "cron:research"
+    assert reloaded.payload.research_id == "complex-reasoning"
     assert reloaded.payload.last_sync_message_timestamp == "2026-05-21T01:00:00"
     assert reloaded.payload.sync_max_messages == 7
     assert reloaded.payload.sync_max_chars == 9000

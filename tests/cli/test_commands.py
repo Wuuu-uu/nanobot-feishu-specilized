@@ -1496,12 +1496,17 @@ def test_gateway_context_cron_streams_when_channel_streaming_enabled(
 
         async def process_direct(
             self,
-            *_args,
+            *args,
             on_progress=None,
             on_stream=None,
             on_stream_end=None,
-            **_kwargs,
+            **kwargs,
         ):
+            content = args[0] if args else kwargs.get("content", "")
+            metadata = kwargs.get("metadata") or {}
+            assert "Scheduled objective:\nRun something." in content
+            assert metadata["_context_profile"] == "autopilot_worker"
+            assert metadata["_autopilot_research_id"] == "test-context-stream"
             assert on_progress is not None
             assert on_stream is not None
             assert on_stream_end is not None
