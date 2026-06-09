@@ -212,6 +212,51 @@ async def test_execute_job_records_run_history(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trigger_job_can_return_running_then_record_result_preview(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(_job):
+        entered.set()
+        await release.wait()
+        return "final autopilot output"
+
+    service = CronService(store_path, on_job=slow)
+    job = service.add_job(
+        name="async-run",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        kind="agent_turn_with_context",
+    )
+
+    result = await service.trigger_job(job.id, wait=False)
+
+    assert result["started"] is True
+    assert result["completed"] is False
+    assert result["status"] == "running"
+    assert result["run_id"]
+    assert entered.is_set()
+
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    assert loaded.state.last_status == "running"
+    assert loaded.state.run_history[-1].run_id == result["run_id"]
+
+    release.set()
+    await _wait_until(
+        lambda: (service.get_job(job.id) or job).state.last_status == "ok",
+        timeout=1.0,
+    )
+
+    loaded = service.get_job(job.id)
+    latest = loaded.state.run_history[-1]
+    assert latest.run_id == result["run_id"]
+    assert latest.status == "ok"
+    assert latest.result_preview == "final autopilot output"
+
+
+@pytest.mark.asyncio
 async def test_run_history_records_errors(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
 

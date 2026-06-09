@@ -75,6 +75,7 @@ class CronService:
     """Service for managing and executing scheduled jobs."""
 
     _MAX_RUN_HISTORY = 20
+    _DEFAULT_RESULT_PREVIEW_CHARS = 4000
 
     def __init__(
         self,
@@ -91,6 +92,7 @@ class CronService:
         self._running = False
         self._timer_active = False
         self._running_jobs: set[str] = set()
+        self._manual_run_tasks: set[asyncio.Task] = set()
         self.max_sleep_ms = max_sleep_ms
 
     def _load_jobs(self) -> tuple[list[CronJob], int] | None:
@@ -184,6 +186,11 @@ class CronService:
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
+                                    run_id=r.get("runId") or r.get("run_id") or "",
+                                    result_preview=(
+                                        r.get("resultPreview")
+                                        or r.get("result_preview")
+                                    ),
                                 )
                                 for r in j.get("state", {}).get("runHistory", [])
                             ],
@@ -321,9 +328,11 @@ class CronService:
                         "runHistory": [
                             {
                                 "runAtMs": r.run_at_ms,
+                                "runId": r.run_id,
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
+                                "resultPreview": r.result_preview,
                             }
                             for r in j.state.run_history
                         ],
@@ -465,27 +474,103 @@ class CronService:
             self._timer_active = False
         self._arm_timer()
 
-    async def _execute_job(self, job: CronJob) -> bool:
+    @staticmethod
+    def _new_run_id() -> str:
+        return str(uuid.uuid4())[:8]
+
+    @staticmethod
+    def _result_preview(result: object, max_chars: int | None = None) -> str | None:
+        if result is None:
+            return None
+        text = str(result)
+        limit = max_chars or CronService._DEFAULT_RESULT_PREVIEW_CHARS
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n... (truncated)"
+
+    def _set_run_running(self, job: CronJob, *, run_id: str, run_at_ms: int) -> None:
+        job.state.last_run_at_ms = run_at_ms
+        job.state.last_status = "running"
+        job.state.last_error = None
+        job.updated_at_ms = _now_ms()
+        job.state.run_history.append(CronRunRecord(
+            run_at_ms=run_at_ms,
+            run_id=run_id,
+            status="running",
+            duration_ms=0,
+            error=None,
+        ))
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+
+    def _finish_run_record(
+        self,
+        job: CronJob,
+        *,
+        run_id: str,
+        run_at_ms: int,
+        status: Literal["ok", "error", "skipped"],
+        duration_ms: int,
+        error: str | None,
+        result_preview: str | None = None,
+    ) -> None:
+        job.state.last_run_at_ms = run_at_ms
+        job.state.last_status = status
+        job.state.last_error = error
+        job.updated_at_ms = _now_ms()
+        for record in reversed(job.state.run_history):
+            if record.run_id == run_id:
+                record.status = status
+                record.duration_ms = duration_ms
+                record.error = error
+                record.result_preview = result_preview
+                break
+        else:
+            job.state.run_history.append(CronRunRecord(
+                run_at_ms=run_at_ms,
+                run_id=run_id,
+                status=status,
+                duration_ms=duration_ms,
+                error=error,
+                result_preview=result_preview,
+            ))
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+
+    async def _execute_job(
+        self,
+        job: CronJob,
+        *,
+        run_id: str | None = None,
+        result_max_chars: int | None = None,
+    ) -> bool:
         """Execute a single job."""
         start_ms = _now_ms()
+        run_id = run_id or self._new_run_id()
         if job.id in self._running_jobs:
             logger.warning("Cron: job '{}' ({}) is already running; skipping trigger", job.name, job.id)
             self._record_job_run(
                 job,
+                run_id=run_id,
                 run_at_ms=start_ms,
                 status="skipped",
                 duration_ms=0,
                 error="already running",
             )
             self._advance_job_schedule(job)
+            self._save_store()
             return False
 
         self._running_jobs.add(job.id)
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
+        self._set_run_running(job, run_id=run_id, run_at_ms=start_ms)
+        self._save_store()
+        result_preview = None
 
         try:
             if self.on_job:
-                await self.on_job(job)
+                result = await self.on_job(job)
+                result_preview = self._result_preview(result, result_max_chars)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -499,36 +584,44 @@ class CronService:
             self._running_jobs.discard(job.id)
 
         end_ms = _now_ms()
-        self._record_job_run(
+        self._finish_run_record(
             job,
+            run_id=run_id,
             run_at_ms=start_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
+            result_preview=result_preview,
         )
 
         self._advance_job_schedule(job)
+        self._save_store()
         return True
 
     def _record_job_run(
         self,
         job: CronJob,
         *,
+        run_id: str | None = None,
         run_at_ms: int,
-        status: Literal["ok", "error", "skipped"],
+        status: Literal["running", "ok", "error", "skipped"],
         duration_ms: int,
         error: str | None,
+        result_preview: str | None = None,
     ) -> None:
         """Record a job execution attempt, including skipped overlap triggers."""
+        run_id = run_id or self._new_run_id()
         job.state.last_run_at_ms = run_at_ms
         job.state.last_status = status
         job.state.last_error = error
         job.updated_at_ms = _now_ms()
         job.state.run_history.append(CronRunRecord(
             run_at_ms=run_at_ms,
+            run_id=run_id,
             status=status,
             duration_ms=duration_ms,
             error=error,
+            result_preview=result_preview,
         ))
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
@@ -782,6 +875,101 @@ class CronService:
             self._running = was_running
             if was_running:
                 self._arm_timer()
+
+    @staticmethod
+    def _find_run_record(job: CronJob | None, run_id: str | None) -> CronRunRecord | None:
+        if job is None or not run_id:
+            return None
+        for record in reversed(job.state.run_history):
+            if record.run_id == run_id:
+                return record
+        return None
+
+    async def trigger_job(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        wait: bool = False,
+        wait_timeout_s: float | None = None,
+        result_max_chars: int | None = None,
+    ) -> dict[str, Any]:
+        """Trigger a job and optionally wait for a bounded result preview."""
+        was_running = self._running
+        self._running = True
+        store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None) if store else None
+        if job is None:
+            self._running = was_running
+            return {
+                "job_id": job_id,
+                "found": False,
+                "started": False,
+                "completed": True,
+                "status": "not_found",
+                "error": "job not found",
+            }
+        if not force and not job.enabled:
+            self._running = was_running
+            return {
+                "job_id": job.id,
+                "job_name": job.name,
+                "found": True,
+                "started": False,
+                "completed": True,
+                "status": "disabled",
+                "error": "job is disabled",
+            }
+
+        run_id = self._new_run_id()
+        task = asyncio.create_task(
+            self._execute_job(
+                job,
+                run_id=run_id,
+                result_max_chars=result_max_chars,
+            )
+        )
+        self._manual_run_tasks.add(task)
+        task.add_done_callback(self._manual_run_tasks.discard)
+
+        try:
+            # Let the task create the running record before we return a handle.
+            await asyncio.sleep(0)
+            if wait:
+                if wait_timeout_s and wait_timeout_s > 0:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout_s)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await task
+        finally:
+            self._running = was_running
+            if was_running:
+                self._arm_timer()
+
+        latest = self.get_job(job.id) or job
+        record = self._find_run_record(latest, run_id)
+        status = record.status if record else latest.state.last_status
+        completed = bool(status and status != "running")
+        return {
+            "job_id": latest.id,
+            "job_name": latest.name,
+            "kind": latest.payload.kind,
+            "run_id": run_id,
+            "found": True,
+            "started": True,
+            "completed": completed,
+            "status": status or "unknown",
+            "error": record.error if record else latest.state.last_error,
+            "duration_ms": record.duration_ms if record else 0,
+            "result_preview": record.result_preview if record else None,
+            "worker_session_key": latest.payload.worker_session_key or f"cron:{latest.id}",
+            "sync_session_key": latest.payload.sync_session_key,
+            "context_session_key": latest.payload.context_session_key,
+            "research_id": latest.payload.research_id,
+            "deliver": latest.payload.deliver,
+        }
 
     def get_job(self, job_id: str) -> CronJob | None:
         """Get a job by ID."""

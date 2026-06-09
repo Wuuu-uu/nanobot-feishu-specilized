@@ -13,9 +13,10 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
+from nanobot.utils.helpers import truncate_string
 
 _CRON_PARAMETERS = tool_parameters_schema(
-    action=StringSchema("Action to perform", enum=["add", "list", "remove", "enable", "run"]),
+    action=StringSchema("Action to perform", enum=["add", "list", "remove", "enable", "run", "status"]),
     name=StringSchema(
         "Optional short human-readable label for the job "
         "(e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
@@ -89,15 +90,37 @@ _CRON_PARAMETERS = tool_parameters_schema(
     ),
     enabled=BooleanSchema(description="Whether to enable or disable a job for action='enable'."),
     force=BooleanSchema(description="Run a disabled job anyway for action='run'.", default=False),
+    wait=BooleanSchema(
+        description=(
+            "For action='run': whether to wait for the triggered run to finish. "
+            "Defaults to false for agent_turn_with_context autonomous workers and true for short jobs."
+        ),
+        nullable=True,
+    ),
+    wait_timeout_seconds=IntegerSchema(
+        0,
+        description=(
+            "For action='run' with wait=true: maximum seconds to wait before returning a running handle. "
+            "0 means wait until completion for short jobs."
+        ),
+        minimum=0,
+        maximum=600,
+    ),
+    result_max_chars=IntegerSchema(
+        2000,
+        description="Maximum result preview characters returned by run/status.",
+        minimum=200,
+        maximum=20000,
+    ),
     include_disabled=BooleanSchema(
         description="Include disabled jobs when action='list'.",
         default=False,
     ),
-    job_id=StringSchema("REQUIRED when action='remove', 'enable', or 'run'. Job ID to operate on."),
+    job_id=StringSchema("REQUIRED when action='remove', 'enable', 'run', or 'status'. Job ID to operate on."),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message or command plus one schedule "
-        "(every_seconds, cron_expr, or at); remove/enable/run require job_id; list only needs action. "
+        "(every_seconds, cron_expr, or at); remove/enable/run/status require job_id; list only needs action. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
         "reject oneOf/anyOf/allOf/enum/not at the root of function parameters."
@@ -164,7 +187,7 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove, enable, run. "
+            "Schedule reminders and recurring tasks. Actions: add, list, remove, enable, run, status. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
@@ -175,7 +198,7 @@ class CronTool(Tool):
         message = str(params.get("message") or "").strip()
         if action == "add" and not command and not message:
             errors.append("message or command is required when action='add'")
-        if action in {"remove", "enable", "run"} and not str(params.get("job_id") or "").strip():
+        if action in {"remove", "enable", "run", "status"} and not str(params.get("job_id") or "").strip():
             errors.append(f"job_id is required when action='{action}'")
         return errors
 
@@ -196,6 +219,9 @@ class CronTool(Tool):
         deliver: bool | None = None,
         enabled: bool = True,
         force: bool = False,
+        wait: bool | None = None,
+        wait_timeout_seconds: int = 0,
+        result_max_chars: int = 2000,
         include_disabled: bool = False,
         context_session_key: str | None = None,
         sync_session_key: str | None = None,
@@ -233,7 +259,15 @@ class CronTool(Tool):
         elif action == "enable":
             return self._enable_job(job_id, enabled)
         elif action == "run":
-            return await self._run_job(job_id, force)
+            return await self._run_job(
+                job_id,
+                force,
+                wait=wait,
+                wait_timeout_seconds=wait_timeout_seconds,
+                result_max_chars=result_max_chars,
+            )
+        elif action == "status":
+            return self._status_job(job_id, result_max_chars=result_max_chars)
         return f"Unknown action: {action}"
 
     def _add_job(
@@ -464,10 +498,131 @@ class CronTool(Tool):
             return f"Job {job_id} not found"
         return f"Job {job_id} {'enabled' if enabled else 'disabled'}"
 
-    async def _run_job(self, job_id: str | None, force: bool) -> str:
+    @staticmethod
+    def _preview(text: str | None, max_chars: int = 2000) -> str | None:
+        if not text:
+            return None
+        return truncate_string(text, max_chars, suffix="\n... (truncated)")
+
+    def _job_route_lines(self, job: CronJob) -> list[str]:
+        lines: list[str] = []
+        if job.payload.kind == "agent_turn_with_context":
+            worker = job.payload.worker_session_key or f"cron:{job.id}"
+            lines.append(f"Worker session: {worker}")
+            if job.payload.sync_session_key:
+                lines.append(f"Sync session: {job.payload.sync_session_key}")
+            if job.payload.context_session_key:
+                lines.append(f"Context session: {job.payload.context_session_key}")
+            if job.payload.research_id:
+                lines.append(f"Research ID: {job.payload.research_id}")
+            if job.payload.deliver:
+                lines.append("Delivery: final response will be delivered to the configured channel.")
+        elif job.payload.deliver:
+            lines.append("Delivery: result will be delivered to the configured channel.")
+        return lines
+
+    def _format_run_result(
+        self,
+        result: dict[str, Any],
+        *,
+        waited: bool,
+        wait_timeout_seconds: int,
+        result_max_chars: int,
+    ) -> str:
+        if not result.get("found", False):
+            return f"Job {result.get('job_id') or ''} not found"
+        if not result.get("started", False):
+            status = result.get("status") or "unknown"
+            error = result.get("error")
+            suffix = f": {error}" if error else ""
+            return f"Failed to run job {result['job_id']} ({status}){suffix}"
+
+        completed = bool(result.get("completed"))
+        status = result.get("status") or "unknown"
+        if completed and waited:
+            lines = [f"Executed job {result['job_id']} (run {result.get('run_id')})"]
+        elif completed:
+            lines = [f"Triggered job {result['job_id']} (run {result.get('run_id')}) completed quickly"]
+        elif waited and wait_timeout_seconds > 0:
+            lines = [
+                f"Triggered job {result['job_id']} (run {result.get('run_id')}); "
+                f"still running after {wait_timeout_seconds}s"
+            ]
+        else:
+            lines = [f"Triggered job {result['job_id']} (run {result.get('run_id')})"]
+        lines.append(f"Status: {status}")
+        if result.get("duration_ms"):
+            lines.append(f"Duration: {result['duration_ms']}ms")
+        if result.get("error"):
+            lines.append(f"Error: {result['error']}")
+        if preview := self._preview(result.get("result_preview"), result_max_chars):
+            lines.append(f"Result preview:\n{preview}")
+        if result.get("kind") == "agent_turn_with_context":
+            if worker := result.get("worker_session_key"):
+                lines.append(f"Worker session: {worker}")
+            if sync := result.get("sync_session_key"):
+                lines.append(f"Sync session: {sync}")
+            if context := result.get("context_session_key"):
+                lines.append(f"Context session: {context}")
+            if research_id := result.get("research_id"):
+                lines.append(f"Research ID: {research_id}")
+            if result.get("deliver"):
+                lines.append("Delivery: final response will be delivered to the configured channel.")
+        lines.append(f"Inspect later with cron(action='status', job_id='{result['job_id']}').")
+        return "\n".join(lines)
+
+    async def _run_job(
+        self,
+        job_id: str | None,
+        force: bool,
+        *,
+        wait: bool | None,
+        wait_timeout_seconds: int,
+        result_max_chars: int,
+    ) -> str:
         if not job_id:
             return "Error: job_id is required for run"
-        ok = await self._cron.run_job(job_id, force=force)
-        if ok:
-            return f"Executed job {job_id}"
-        return f"Failed to run job {job_id}"
+        job = self._cron.get_job(job_id)
+        if not job:
+            return f"Job {job_id} not found"
+        effective_wait = (job.payload.kind != "agent_turn_with_context") if wait is None else bool(wait)
+        preview_chars = result_max_chars if result_max_chars and result_max_chars > 0 else 2000
+        result = await self._cron.trigger_job(
+            job_id,
+            force=force,
+            wait=effective_wait,
+            wait_timeout_s=wait_timeout_seconds if wait_timeout_seconds and wait_timeout_seconds > 0 else None,
+            result_max_chars=preview_chars,
+        )
+        return self._format_run_result(
+            result,
+            waited=effective_wait,
+            wait_timeout_seconds=wait_timeout_seconds or 0,
+            result_max_chars=preview_chars,
+        )
+
+    def _status_job(self, job_id: str | None, *, result_max_chars: int = 2000) -> str:
+        if not job_id:
+            return "Error: job_id is required for status"
+        job = self._cron.get_job(job_id)
+        if not job:
+            return f"Job {job_id} not found"
+
+        timing = self._format_timing(job.schedule)
+        state = "enabled" if job.enabled else "disabled"
+        lines = [f"Job {job.name} (id: {job.id}, {timing}, {state})"]
+        lines.append(f"Type: {job.payload.kind}")
+        lines.extend(self._job_route_lines(job))
+        lines.extend(self._format_state(job.state, job.schedule))
+        if job.state.run_history:
+            lines.append("Recent runs:")
+            for record in job.state.run_history[-5:]:
+                run_id = f" {record.run_id}" if record.run_id else ""
+                detail = f"-{run_id}: {record.status}, duration={record.duration_ms}ms"
+                if record.error:
+                    detail += f", error={record.error}"
+                lines.append(detail)
+            latest = job.state.run_history[-1]
+            if preview := self._preview(latest.result_preview, result_max_chars):
+                lines.append(f"Latest result preview:\n{preview}")
+        return "\n".join(lines)

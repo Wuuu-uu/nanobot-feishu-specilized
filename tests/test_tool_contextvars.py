@@ -8,6 +8,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.cron.service import CronService
+from nanobot.cron.types import CronSchedule
 
 
 @pytest.mark.asyncio
@@ -241,6 +242,51 @@ async def test_cron_tool_context_job_defaults_to_current_session(tmp_path) -> No
     assert job.payload.sync_session_key == "feishu:ou_123:main"
     assert job.payload.worker_session_key is None
     assert job.payload.research_id == "demo-research"
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_run_autonomous_worker_defaults_to_async_status(tmp_path) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(_job):
+        entered.set()
+        await release.wait()
+        return "autopilot final report"
+
+    service = CronService(tmp_path / "jobs.json", on_job=slow)
+    tool = CronTool(service)
+    job = service.add_job(
+        name="autopilot",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="continue autonomous research",
+        kind="agent_turn_with_context",
+        deliver=True,
+        context_session_key="feishu:main",
+        sync_session_key="feishu:main",
+        worker_session_key="cron:autopilot",
+        research_id="demo-research",
+    )
+
+    result = await tool.execute(action="run", job_id=job.id)
+
+    assert result.startswith(f"Triggered job {job.id}")
+    assert "Status: running" in result
+    assert "Worker session: cron:autopilot" in result
+    assert "Sync session: feishu:main" in result
+    assert "Inspect later with cron(action='status'" in result
+    assert entered.is_set()
+
+    release.set()
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while asyncio.get_running_loop().time() < deadline:
+        status = await tool.execute(action="status", job_id=job.id)
+        if "Status: running" not in status and "autopilot final report" in status:
+            break
+        await asyncio.sleep(0.01)
+
+    status = await tool.execute(action="status", job_id=job.id)
+    assert "Latest result preview:\nautopilot final report" in status
 
 
 @pytest.mark.asyncio
